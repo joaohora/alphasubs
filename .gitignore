@@ -1,0 +1,17 @@
+# Python virtual environment (large, machine-specific — never commit this)
+.venv/
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# User-specific local state (kept out of the repo on purpose)
+.DS_Store
+*.alphasubs_presets.json
+
+# Editor/OS cruft
+.vscode/
+.idea/
