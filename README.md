@@ -118,4 +118,3 @@ build_windows.bat   # builds dist\AlphaSubs.exe via PyInstaller (run on Windows)
 tools/test_source.py  # synthetic NDI source for loopback testing
 ```
 # test marker 1788511560
-# test marker 2 1788511652
