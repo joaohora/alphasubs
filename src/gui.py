@@ -7,7 +7,10 @@ the terminal.
 """
 
 import json
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -90,6 +93,10 @@ def _load_version():
 
 
 APP_VERSION, APP_RELEASE_DATE = _load_version()
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GIT_REMOTE = "origin"
+GIT_BRANCH = "main"
 
 
 class App:
@@ -300,6 +307,10 @@ class App:
         ttk.Label(
             footer, text=version_text, foreground=MUTED_FG, font=(self.font_family, 8)
         ).pack(side="right")
+        if (REPO_ROOT / ".git").is_dir():
+            self._make_simple_button(
+                footer, "Check for Updates", self._check_for_updates, height=20
+            ).pack(side="right", padx=(0, 10))
 
     def _build_box_ui(self, pad):
         frame = ttk.LabelFrame(self.root, text="BACKGROUND BOX   ·   plate behind the shadow/text")
@@ -1041,6 +1052,12 @@ class App:
                     self.source_combo.config(state="readonly")
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
+                elif kind == "update_checked":
+                    status, detail = payload
+                    self._on_update_checked(status, detail)
+                elif kind == "update_applied":
+                    status, detail = payload
+                    self._on_update_applied(status, detail)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
@@ -1129,6 +1146,75 @@ class App:
                 12, 10, text="MUTED", anchor="nw", fill=REC_BG,
                 font=(self.font_family, 16, "bold"),
             )
+
+    # ---------- Updates (git pull from GitHub) ----------
+
+    def _check_for_updates(self):
+        self._append_log("Checking for updates...")
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self):
+        try:
+            self._run_git("fetch", "--quiet", GIT_REMOTE, GIT_BRANCH)
+            local = self._run_git("rev-parse", "HEAD").strip()
+            remote = self._run_git("rev-parse", f"{GIT_REMOTE}/{GIT_BRANCH}").strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            self.msg_queue.put(("update_checked", ("error", str(e))))
+            return
+        status = "up_to_date" if local == remote else "available"
+        self.msg_queue.put(("update_checked", (status, None)))
+
+    def _on_update_checked(self, status, detail):
+        if status == "error":
+            self._append_log(f"Update check failed: {detail}")
+            messagebox.showerror(f"{APP_NAME} - update", f"Could not check for updates:\n\n{detail}")
+        elif status == "up_to_date":
+            self._append_log("Already up to date.")
+            messagebox.showinfo(f"{APP_NAME} - update", "You're already on the latest version.")
+        elif status == "available":
+            self._append_log("An update is available.")
+            if messagebox.askyesno(
+                f"{APP_NAME} - update", "An update is available. Download and apply it now?"
+            ):
+                self._append_log("Applying update...")
+                threading.Thread(target=self._update_apply_worker, daemon=True).start()
+
+    def _update_apply_worker(self):
+        try:
+            self._run_git("pull", "--ff-only", GIT_REMOTE, GIT_BRANCH)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.msg_queue.put(("update_applied", ("error", str(e))))
+            return
+        self.msg_queue.put(("update_applied", ("ok", None)))
+
+    def _on_update_applied(self, status, detail):
+        if status == "error":
+            self._append_log(f"Update failed: {detail}")
+            messagebox.showerror(
+                f"{APP_NAME} - update",
+                f"Could not apply the update automatically:\n\n{detail}\n\n"
+                "You can update manually by running 'git pull' in the project folder.",
+            )
+            return
+        self._append_log("Update applied.")
+        if messagebox.askyesno(f"{APP_NAME} - update", "Update applied. Restart now to use the new version?"):
+            self._restart_app()
+        else:
+            messagebox.showinfo(f"{APP_NAME} - update", "Restart the app manually to use the new version.")
+
+    @staticmethod
+    def _run_git(*args):
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise subprocess.SubprocessError(result.stderr.strip() or f"git {' '.join(args)} failed")
+        return result.stdout
+
+    def _restart_app(self):
+        self._on_close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _on_close(self):
         self._save_output_defaults()
