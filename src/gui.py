@@ -40,8 +40,10 @@ PRESET_ATTRS = (
     "black_level", "white_level", "shadow_dx", "shadow_dy",
     "shadow_blur_sigma", "shadow_opacity",
     "box_opacity", "box_w", "box_h", "box_pos_x", "box_pos_y",
+    "key_similarity", "key_smoothness",
 )
-PRESET_COLOR_ATTRS = ("text_color_bgr", "shadow_color_bgr", "box_color_bgr")
+PRESET_COLOR_ATTRS = ("text_color_bgr", "shadow_color_bgr", "box_color_bgr", "key_color_bgr")
+KEY_MODE_LABELS = {"luma": "Black background (luma)", "color": "Custom color"}
 OUTPUT_ATTRS = ("canvas_w", "canvas_h", "fps_n", "fps_d", "scale", "pos_x_px", "pos_y_px")
 POS_RANGE = 1000
 BOX_SIZE_MAX = 3840
@@ -99,10 +101,23 @@ GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 
 
+def _icon_path():
+    # In a PyInstaller --onefile build, bundled data (see --add-data in
+    # build_windows.bat) is unpacked next to sys._MEIPASS at runtime instead
+    # of living under REPO_ROOT.
+    base = Path(getattr(sys, "_MEIPASS", REPO_ROOT))
+    return base / "assets" / "icon.png"
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title(f"{APP_NAME} (NDI)")
+        try:
+            self._icon_image = ImageTk.PhotoImage(Image.open(_icon_path()))
+            root.iconphoto(True, self._icon_image)
+        except (OSError, tk.TclError):
+            pass
 
         self.live_cfg = KeyerConfig()
         self.sliders = {}
@@ -118,12 +133,16 @@ class App:
         self.log_lines = []
         self.zoom = 1.0
         self.muted = False
+        self.last_raw_bgr = None
+        self.picking_color = False
+        self._pick_scale = 1.0
         self.presets = self._load_presets()
         self.output_cfg = self._load_output_defaults()
 
         ndi_io.initialize()
 
         self._apply_theme()
+        self._build_scroll_container()
         self._build_ui()
         self._lock_window_size()
         self._refresh_sources()
@@ -208,13 +227,57 @@ class App:
         root.option_add("*TCombobox*Listbox.selectForeground", ACCENT_FG)
         root.option_add("*Font", base_font)
 
+    def _build_scroll_container(self):
+        """Wraps all main-window content in a canvas + vertical scrollbar, so
+        the app stays usable on small/low-resolution displays where the full
+        content wouldn't otherwise fit on screen. `self.content` is the frame
+        that all UI sections should be built into (instead of `self.root`)."""
+        canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def on_content_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        content.bind("<Configure>", on_content_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self._scroll_canvas = canvas
+        self._vscroll = vscroll
+        self.content = content
+
     def _lock_window_size(self):
-        """Locks the main window to its content's natural size — no resizing,
-        no maximize/zoom."""
+        """Sizes the main window to fit its content, but capped to the screen
+        size (leaving room for the taskbar/title bar). On small displays the
+        window shrinks to fit and the content becomes scrollable instead of
+        being cut off. No manual resizing (no drag-resize/maximize)."""
         root = self.root
         root.update_idletasks()
-        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-        root.geometry(f"{w}x{h}")
+        content_w = self.content.winfo_reqwidth()
+        content_h = self.content.winfo_reqheight()
+        sb_w = self._vscroll.winfo_reqwidth()
+
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        max_h = max(300, screen_h - 90)
+        win_h = min(content_h, max_h)
+        win_w = min(content_w + sb_w, screen_w - 40)
+
+        root.geometry(f"{win_w}x{win_h}")
         root.resizable(False, False)
 
     # ---------- UI ----------
@@ -224,56 +287,13 @@ class App:
 
         self.input_info_var = tk.StringVar(value="Input: —")
         self.output_info_var = tk.StringVar(value="Output: —")
+        self.box_enabled_var = tk.BooleanVar(value=self.live_cfg.box_enabled)
 
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=pad["padx"], pady=(10, 4))
-        top.columnconfigure(1, weight=1)
-
-        ttk.Label(top, text="NDI source:").grid(row=0, column=0, sticky="w")
-        self.source_var = tk.StringVar()
-        self.source_combo = ttk.Combobox(top, textvariable=self.source_var, state="readonly", width=42)
-        self.source_combo.grid(row=0, column=1, sticky="we", padx=4)
-        self._make_simple_button(top, "Refresh", self._refresh_sources).grid(row=0, column=2, padx=4)
-
-        ttk.Label(top, textvariable=self.input_info_var, foreground=MUTED_FG).grid(
-            row=1, column=1, sticky="w", padx=4, pady=(2, 0)
-        )
-
-        ttk.Label(top, text="Output name:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.output_name_var = tk.StringVar(value=APP_NAME)
-        ttk.Entry(top, textvariable=self.output_name_var).grid(
-            row=2, column=1, sticky="we", padx=4, pady=(8, 0)
-        )
-
-        sliders = ttk.LabelFrame(self.root, text="ADJUSTMENTS")
-        sliders.pack(fill="x", **pad)
-        sliders.columnconfigure(1, weight=1)
-
-        self._add_slider(sliders, 0, "Black level", 0, 255, self.live_cfg.black_level, "black_level")
-        self._add_slider(sliders, 1, "White level", 0, 255, self.live_cfg.white_level, "white_level")
-        self._add_slider(sliders, 2, "Shadow X (px)", -20, 20, self.live_cfg.shadow_dx, "shadow_dx")
-        self._add_slider(sliders, 3, "Shadow Y (px)", -20, 20, self.live_cfg.shadow_dy, "shadow_dy")
-        self._add_slider(sliders, 4, "Shadow blur", 0, 20, self.live_cfg.shadow_blur_sigma, "shadow_blur_sigma")
-        self._add_slider(
-            sliders, 5, "Shadow opacity", 0, 1, self.live_cfg.shadow_opacity, "shadow_opacity", decimals=2
-        )
-
-        colors_row = ttk.Frame(sliders)
-        colors_row.grid(row=6, column=0, columnspan=3, sticky="we", padx=4, pady=(4, 6))
-        self.text_color_swatch = self._add_color_picker(colors_row, "Text color:", "text_color_bgr")
-        ttk.Label(colors_row, text="   Shadow color:").pack(side="left")
-        self.color_swatch = self._add_color_picker(
-            colors_row, "", "shadow_color_bgr", title="Shadow color"
-        )
-
-        self._build_box_ui(pad)
+        self._build_pipeline_row(pad)
         self._build_presets_ui(pad)
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=pad["padx"], pady=6)
+        ttk.Separator(self.content, orient="horizontal").pack(fill="x", padx=pad["padx"], pady=6)
 
-        self._build_output_ui(pad)
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=pad["padx"], pady=6)
-
-        controls = ttk.Frame(self.root)
+        controls = ttk.Frame(self.content)
         controls.pack(fill="x", padx=pad["padx"], pady=(0, 4))
         self.start_btn = self._make_float_button(
             controls,
@@ -297,29 +317,277 @@ class App:
         self.status_var = tk.StringVar(value="Stopped.")
         ttk.Label(controls, textvariable=self.status_var, foreground=MUTED_FG).pack(side="left", padx=12)
 
-        self._update_output_info_label()
+        if (REPO_ROOT / ".git").is_dir():
+            self._make_simple_button(
+                controls, "Check for Updates", self._check_for_updates
+            ).pack(side="right")
 
-        footer = ttk.Frame(self.root)
+        footer = ttk.Frame(self.content)
         footer.pack(fill="x", padx=pad["padx"], pady=(0, 8))
         version_text = f"{APP_NAME} v{APP_VERSION}"
         if APP_RELEASE_DATE:
             version_text += f"  ·  {APP_RELEASE_DATE}"
         ttk.Label(
             footer, text=version_text, foreground=MUTED_FG, font=(self.font_family, 8)
-        ).pack(side="right")
-        if (REPO_ROOT / ".git").is_dir():
-            self._make_simple_button(
-                footer, "Check for Updates", self._check_for_updates, height=20
-            ).pack(side="right", padx=(0, 10))
+        ).pack()
 
-    def _build_box_ui(self, pad):
-        frame = ttk.LabelFrame(self.root, text="BACKGROUND BOX   ·   plate behind the shadow/text")
-        frame.pack(fill="x", padx=pad["padx"], pady=2)
+        # Each pipeline module's full specs live in its own floating, non-modal
+        # panel (built once, shown/hidden — never destroyed, so their widgets
+        # stay valid even while the panel is hidden).
+        self._build_source_panel()
+        self._build_text_panel()
+        self._build_background_panel()
+        self._build_output_panel()
+
+        self._update_output_info_label()
+        self._update_source_card()
+        self._update_text_card()
+        self._update_background_card()
+        self._update_output_card()
+
+    # ---------- Pipeline row (home screen) ----------
+
+    def _build_pipeline_row(self, pad):
+        """The home screen: the signal chain as a row of clickable module
+        cards connected by arrows. Each card shows a glanceable summary of
+        that module's current specs; clicking it opens its floating panel."""
+        row = ttk.Frame(self.content)
+        row.pack(fill="x", padx=pad["padx"], pady=(10, 6))
+
+        self.source_card_var = tk.StringVar(value="No source selected")
+        self.text_card_var = tk.StringVar(value="")
+        self.background_card_var = tk.StringVar(value="")
+        self.output_card_var = tk.StringVar(value="")
+
+        self._make_module_card(row, "NDI SOURCE", self.source_card_var, self._open_source_panel).pack(side="left")
+        self._make_arrow(row).pack(side="left", padx=4)
+        self._make_module_card(row, "TEXT", self.text_card_var, self._open_text_panel).pack(side="left")
+        self._make_arrow(row).pack(side="left", padx=4)
+        self._make_module_card(
+            row, "BACKGROUND", self.background_card_var, self._open_background_panel,
+            extra=self._add_background_card_checkbox,
+        ).pack(side="left")
+        self._make_arrow(row).pack(side="left", padx=4)
+        self._make_module_card(row, "OUTPUT", self.output_card_var, self._open_output_panel).pack(side="left")
+
+    def _add_background_card_checkbox(self, inner):
+        """Extra content for the BACKGROUND card: the Enabled checkbox, right
+        on the card, so it can be toggled without opening the full panel."""
+        tk.Checkbutton(
+            inner, text="Enabled", variable=self.box_enabled_var, command=self._toggle_box_enabled,
+            bg=PANEL_BG, fg=FG, activebackground=PANEL_BG, activeforeground=FG,
+            selectcolor=FIELD_BG, highlightthickness=0, bd=0, font=self.normal_font,
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _make_arrow(self, parent):
+        return tk.Label(parent, text="→", bg=BG, fg=MUTED_FG, font=(self.font_family, 18, "bold"))
+
+    def _make_module_card(self, parent, title, info_var, command, extra=None):
+        """A clickable card (title + live summary) representing one pipeline
+        module. Reused, fixed-size flat panel-style box, matching the app's
+        broadcast-console look; hover highlights its border in accent color.
+        Its content is vertically centered via an inner frame that packs with
+        expand=True. `extra`, if given, is called with that inner frame so a
+        card can host a small interactive control (e.g. an inline checkbox)
+        in addition to its title/summary — that control keeps its own click
+        behavior and doesn't open the panel."""
+        card = tk.Frame(
+            parent, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER,
+            cursor="hand2", width=200, height=92,
+        )
+        card.pack_propagate(False)
+
+        inner = tk.Frame(card, bg=PANEL_BG)
+        inner.pack(expand=True)
+
+        title_lbl = tk.Label(
+            inner, text=title, bg=PANEL_BG, fg=MUTED_FG, font=(self.font_family, 9, "bold"), anchor="w",
+        )
+        title_lbl.pack(fill="x", pady=(0, 3), anchor="w")
+
+        info_lbl = tk.Label(
+            inner, textvariable=info_var, bg=PANEL_BG, fg=FG, font=self.normal_font,
+            anchor="w", justify="left", wraplength=180,
+        )
+        info_lbl.pack(fill="x", anchor="w")
+
+        if extra:
+            extra(inner)
+
+        def on_enter(_event):
+            card.config(highlightbackground=ACCENT)
+
+        def on_leave(_event):
+            card.config(highlightbackground=BORDER)
+
+        def on_click(_event):
+            command()
+
+        for w in (card, inner, title_lbl, info_lbl):
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<Button-1>", on_click)
+
+        return card
+
+    def _update_source_card(self):
+        name = self.source_var.get().strip() or "No source selected"
+        info = self.input_info_var.get()
+        if info and info != "Input: —":
+            self.source_card_var.set(f"{name}\n{info.replace('Input: ', '')}")
+        else:
+            self.source_card_var.set(name)
+
+    def _update_text_card(self):
+        if self.live_cfg.key_mode == "color":
+            b, g, r = self.live_cfg.key_color_bgr
+            self.text_card_var.set(f"Color key\nRGB({r}, {g}, {b})")
+        else:
+            self.text_card_var.set(
+                f"Luma\n{self.live_cfg.black_level:.0f} – {self.live_cfg.white_level:.0f}"
+            )
+
+    def _update_background_card(self):
+        self.background_card_var.set(f"{self.live_cfg.box_opacity * 100:.0f}% opacity")
+
+    def _update_output_card(self):
+        cfg = self.output_cfg
+        fps_s = self._fmt_fps(cfg.fps_n, cfg.fps_d)
+        name = self.output_name_var.get().strip() or APP_NAME if hasattr(self, "output_name_var") else APP_NAME
+        self.output_card_var.set(f"{cfg.canvas_w}x{cfg.canvas_h} @ {fps_s} fps\n{name}")
+
+    # ---------- Module panels (floating, non-modal) ----------
+
+    def _make_panel_window(self, title):
+        """A floating panel window for one pipeline module: built once and
+        hidden with withdraw() (never destroyed), so it can be reopened
+        instantly and its widgets stay valid — and non-modal, so the operator
+        can keep watching the live Preview while adjusting it."""
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(title)
+        win.configure(bg=BG)
+        self._darken_titlebar(win)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        return win
+
+    def _open_source_panel(self):
+        self.source_panel.deiconify()
+        self.source_panel.lift()
+
+    def _open_text_panel(self):
+        self.text_panel.deiconify()
+        self.text_panel.lift()
+
+    def _open_background_panel(self):
+        self.background_panel.deiconify()
+        self.background_panel.lift()
+
+    def _open_output_panel(self):
+        self.output_panel.deiconify()
+        self.output_panel.lift()
+
+    def _build_source_panel(self):
+        win = self._make_panel_window("NDI Source")
+        self.source_panel = win
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="NDI source:").grid(row=0, column=0, sticky="w")
+        self.source_var = tk.StringVar()
+        self.source_combo = ttk.Combobox(body, textvariable=self.source_var, state="readonly", width=42)
+        self.source_combo.grid(row=0, column=1, sticky="we", padx=4)
+        self.source_combo.bind("<<ComboboxSelected>>", lambda e: self._update_source_card())
+        self._make_simple_button(body, "Refresh", self._refresh_sources).grid(row=0, column=2, padx=4)
+
+        ttk.Label(body, textvariable=self.input_info_var, foreground=MUTED_FG).grid(
+            row=1, column=1, sticky="w", padx=4, pady=(4, 0)
+        )
+
+    def _build_text_panel(self):
+        win = self._make_panel_window("Text — keying, shadow & color")
+        self.text_panel = win
+
+        sliders = ttk.Frame(win)
+        sliders.pack(fill="both", expand=True, padx=10, pady=10)
+        sliders.columnconfigure(1, weight=1)
+
+        mode_row = ttk.Frame(sliders)
+        mode_row.grid(row=0, column=0, columnspan=3, sticky="we", padx=4, pady=(0, 6))
+        ttk.Label(mode_row, text="Key mode:").pack(side="left")
+        self.key_mode_var = tk.StringVar(value=KEY_MODE_LABELS[self.live_cfg.key_mode])
+        key_mode_combo = ttk.Combobox(
+            mode_row, textvariable=self.key_mode_var, state="readonly",
+            values=list(KEY_MODE_LABELS.values()), width=22,
+        )
+        key_mode_combo.pack(side="left", padx=6)
+        key_mode_combo.bind("<<ComboboxSelected>>", self._on_key_mode_change)
+
+        self.luma_frame = ttk.Frame(sliders)
+        self.luma_frame.grid(row=1, column=0, columnspan=3, sticky="we")
+        self.luma_frame.columnconfigure(1, weight=1)
+        self._add_slider(
+            self.luma_frame, 0, "Black level", 0, 255, self.live_cfg.black_level, "black_level",
+            on_change=lambda _v: self._update_text_card(),
+        )
+        self._add_slider(
+            self.luma_frame, 1, "White level", 0, 255, self.live_cfg.white_level, "white_level",
+            on_change=lambda _v: self._update_text_card(),
+        )
+
+        self.color_key_frame = ttk.Frame(sliders)
+        self.color_key_frame.grid(row=1, column=0, columnspan=3, sticky="we")
+        self.color_key_frame.columnconfigure(1, weight=1)
+        ck_color_row = ttk.Frame(self.color_key_frame)
+        ck_color_row.grid(row=0, column=0, columnspan=3, sticky="we", padx=4, pady=(2, 4))
+        ttk.Label(ck_color_row, text="Key color:").pack(side="left")
+        self.key_color_swatch = self._add_color_picker(
+            ck_color_row, "", "key_color_bgr", title="Key color"
+        )
+        self.pick_btn = self._make_float_button(
+            ck_color_row,
+            {"idle": ("Pick from preview", "neutral"), "picking": ("Click the preview...", "accent")},
+            "idle", command=self._toggle_color_pick,
+        )
+        self.pick_btn.pack(side="left", padx=(10, 0))
+        self._add_slider(
+            self.color_key_frame, 1, "Similarity", 0, 441.7, self.live_cfg.key_similarity, "key_similarity"
+        )
+        self._add_slider(
+            self.color_key_frame, 2, "Smoothness", 1, 200, self.live_cfg.key_smoothness, "key_smoothness"
+        )
+        if self.live_cfg.key_mode == "color":
+            self.luma_frame.grid_remove()
+        else:
+            self.color_key_frame.grid_remove()
+
+        self._add_slider(sliders, 2, "Shadow X (px)", -20, 20, self.live_cfg.shadow_dx, "shadow_dx")
+        self._add_slider(sliders, 3, "Shadow Y (px)", -20, 20, self.live_cfg.shadow_dy, "shadow_dy")
+        self._add_slider(sliders, 4, "Shadow blur", 0, 20, self.live_cfg.shadow_blur_sigma, "shadow_blur_sigma")
+        self._add_slider(
+            sliders, 5, "Shadow opacity", 0, 1, self.live_cfg.shadow_opacity, "shadow_opacity", decimals=2
+        )
+
+        colors_row = ttk.Frame(sliders)
+        colors_row.grid(row=6, column=0, columnspan=3, sticky="we", padx=4, pady=(4, 0))
+        self.text_color_swatch = self._add_color_picker(colors_row, "Text color:", "text_color_bgr")
+        ttk.Label(colors_row, text="   Shadow color:").pack(side="left")
+        self.color_swatch = self._add_color_picker(
+            colors_row, "", "shadow_color_bgr", title="Shadow color"
+        )
+
+    def _build_background_panel(self):
+        win = self._make_panel_window("Background box")
+        self.background_panel = win
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
         frame.columnconfigure(1, weight=1)
 
         top_row = ttk.Frame(frame)
-        top_row.grid(row=0, column=0, columnspan=3, sticky="we", padx=4, pady=(4, 2))
-        self.box_enabled_var = tk.BooleanVar(value=self.live_cfg.box_enabled)
+        top_row.grid(row=0, column=0, columnspan=3, sticky="we", padx=4, pady=(0, 4))
         ttk.Checkbutton(
             top_row, text="Enabled", variable=self.box_enabled_var,
             command=self._toggle_box_enabled,
@@ -330,7 +598,8 @@ class App:
         )
 
         self._add_slider(
-            frame, 1, "Box opacity", 0, 1, self.live_cfg.box_opacity, "box_opacity", decimals=2
+            frame, 1, "Box opacity", 0, 1, self.live_cfg.box_opacity, "box_opacity", decimals=2,
+            on_change=lambda _v: self._update_background_card(),
         )
         self._add_slider(
             frame, 2, "Box width (px, 0 = full)", 0, BOX_SIZE_MAX, self.live_cfg.box_w, "box_w"
@@ -349,7 +618,7 @@ class App:
 
     def _build_presets_ui(self, pad):
         presets_frame = ttk.LabelFrame(
-            self.root, text="PRESETS   ·   tap = apply   ·   hold = save"
+            self.content, text="PRESETS   ·   tap = apply   ·   hold = save"
         )
         presets_frame.pack(fill="x", padx=pad["padx"], pady=2)
         for i in range(1, PRESET_SLOTS + 1):
@@ -551,9 +820,21 @@ class App:
             parent, {"default": (text, kind)}, "default", command, height=height, min_width=min_width
         )
 
-    def _build_output_ui(self, pad):
-        frame = ttk.LabelFrame(self.root, text="OUTPUT   ·   resolution, fps and signal position")
-        frame.pack(fill="x", padx=pad["padx"], pady=2)
+    def _build_output_panel(self):
+        win = self._make_panel_window("Output — resolution, fps and signal position")
+        self.output_panel = win
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        name_row = ttk.Frame(frame)
+        name_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(name_row, text="Output name:").pack(side="left")
+        self.output_name_var = tk.StringVar(value=APP_NAME)
+        self.output_name_var.trace_add("write", lambda *a: self._update_output_card())
+        ttk.Entry(name_row, textvariable=self.output_name_var).pack(
+            side="left", fill="x", expand=True, padx=6
+        )
 
         res_row = ttk.Frame(frame)
         res_row.pack(fill="x", padx=4, pady=(4, 2))
@@ -655,12 +936,14 @@ class App:
         self.output_cfg.canvas_w = w
         self.output_cfg.canvas_h = h
         self._update_output_info_label()
+        self._update_output_card()
 
     def _on_fps_preset(self, event=None):
         nd = FPS_PRESETS.get(self.fps_var.get())
         if nd:
             self.output_cfg.fps_n, self.output_cfg.fps_d = nd
             self._update_output_info_label()
+            self._update_output_card()
 
     def _center_transform(self):
         self.sliders["scale"].set(1.0)
@@ -688,6 +971,8 @@ class App:
         self._build_preview_window()
 
     def _close_preview_window(self):
+        if self.picking_color:
+            self._end_color_pick()
         if self.preview_window is not None:
             self.preview_window.destroy()
         self.preview_window = None
@@ -736,22 +1021,32 @@ class App:
         vbar.grid(row=0, column=1, sticky="ns")
         hbar.grid(row=1, column=0, sticky="we")
 
-        self.preview_canvas.bind("<ButtonPress-1>", lambda e: self.preview_canvas.scan_mark(e.x, e.y))
-        self.preview_canvas.bind(
-            "<B1-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1)
-        )
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_preview_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_preview_drag)
 
-    def _add_slider(self, parent, row, label, lo, hi, value, attr, decimals=0, target=None):
+    def _on_preview_press(self, event):
+        if self.picking_color:
+            self._on_pick_click(event)
+        else:
+            self.preview_canvas.scan_mark(event.x, event.y)
+
+    def _on_preview_drag(self, event):
+        if not self.picking_color:
+            self.preview_canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _add_slider(self, parent, row, label, lo, hi, value, attr, decimals=0, target=None, on_change=None):
         target = self.live_cfg if target is None else target
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=2)
         val_var = tk.StringVar(value=self._fmt(value, decimals))
 
-        def on_change(v):
+        def _apply(v):
             fv = float(v)
             setattr(target, attr, fv)
             val_var.set(self._fmt(fv, decimals))
+            if on_change:
+                on_change(fv)
 
-        scale = ttk.Scale(parent, from_=lo, to=hi, orient="horizontal", command=on_change)
+        scale = ttk.Scale(parent, from_=lo, to=hi, orient="horizontal", command=_apply)
         scale.grid(row=row, column=1, sticky="we", padx=4, pady=2)
 
         def commit_entry(event=None):
@@ -807,9 +1102,103 @@ class App:
             b = int(hexcolor[5:7], 16)
             setattr(self.live_cfg, attr, (b, g, r))
             swatch.config(bg=hexcolor)
+            if attr == "box_color_bgr":
+                self._update_background_card()
+            else:
+                self._update_text_card()
 
     def _toggle_box_enabled(self):
         self.live_cfg.box_enabled = self.box_enabled_var.get()
+        self._update_background_card()
+
+    # ---------- Key mode ----------
+
+    def _on_key_mode_change(self, event=None):
+        mode = "color" if self.key_mode_var.get() == KEY_MODE_LABELS["color"] else "luma"
+        self._set_key_mode(mode)
+
+    def _set_key_mode(self, mode):
+        self.live_cfg.key_mode = mode
+        self.key_mode_var.set(KEY_MODE_LABELS[mode])
+        if mode == "color":
+            self.luma_frame.grid_remove()
+            self.color_key_frame.grid()
+        else:
+            if self.picking_color:
+                self._end_color_pick()
+            self.color_key_frame.grid_remove()
+            self.luma_frame.grid()
+        self._update_text_card()
+
+    # ---------- Color pick (eyedropper) ----------
+
+    def _toggle_color_pick(self):
+        if self.picking_color:
+            self._end_color_pick()
+            return
+        if self.last_raw_bgr is None:
+            messagebox.showinfo(
+                APP_NAME, "Start the pipeline first so there is a live preview to pick from."
+            )
+            return
+        self._open_preview_window()
+        self.picking_color = True
+        self.pick_btn.set_variant("picking")
+        self._append_log("Click a pixel in the preview to set the key color (Esc to cancel).")
+        self._render_picking_preview()
+        self.preview_canvas.config(cursor="crosshair")
+        self.root.bind("<Escape>", self._end_color_pick)
+
+    def _end_color_pick(self, event=None):
+        self.picking_color = False
+        self.pick_btn.set_variant("idle")
+        if self.preview_canvas is not None and self.preview_canvas.winfo_exists():
+            self.preview_canvas.config(cursor="")
+        self.root.unbind("<Escape>")
+
+    def _render_picking_preview(self):
+        if self.last_raw_bgr is None:
+            return
+        if self.preview_canvas is None or not self.preview_canvas.winfo_exists():
+            return
+        bgr = self.last_raw_bgr
+        h, w = bgr.shape[:2]
+        base_scale = min(1.0, PREVIEW_MAX_W / w)
+        total_scale = base_scale * self.zoom
+        if total_scale != 1.0:
+            new_w = max(1, int(w * total_scale))
+            new_h = max(1, int(h * total_scale))
+            interp = cv2.INTER_AREA if total_scale < 1.0 else cv2.INTER_LINEAR
+            bgr = cv2.resize(bgr, (new_w, new_h), interpolation=interp)
+        self._pick_scale = total_scale
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb, mode="RGB")
+        self.preview_photo = ImageTk.PhotoImage(img)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, image=self.preview_photo, anchor="nw")
+        self.preview_canvas.config(scrollregion=(0, 0, bgr.shape[1], bgr.shape[0]))
+        self.preview_canvas.create_text(
+            12, 10, text="Click to pick the key color  ·  Esc to cancel", anchor="nw",
+            fill=ACCENT, font=(self.font_family, 12, "bold"),
+        )
+
+    def _on_pick_click(self, event):
+        if self.last_raw_bgr is None:
+            return
+        cx = self.preview_canvas.canvasx(event.x)
+        cy = self.preview_canvas.canvasy(event.y)
+        scale = self._pick_scale or 1.0
+        raw = self.last_raw_bgr
+        h, w = raw.shape[:2]
+        x = max(0, min(w - 1, int(cx / scale)))
+        y = max(0, min(h - 1, int(cy / scale)))
+        b, g, r = (int(c) for c in raw[y, x])
+        self.live_cfg.key_color_bgr = (b, g, r)
+        self.key_color_swatch.config(bg=self._bgr_to_hex((b, g, r)))
+        self._append_log(f"Key color picked: RGB({r}, {g}, {b}).")
+        self._update_text_card()
+        self._end_color_pick()
 
     # ---------- Zoom ----------
 
@@ -859,6 +1248,7 @@ class App:
         self.presets[slot] = {attr: getattr(cfg, attr) for attr in PRESET_ATTRS}
         self.presets[slot].update({attr: list(getattr(cfg, attr)) for attr in PRESET_COLOR_ATTRS})
         self.presets[slot]["box_enabled"] = cfg.box_enabled
+        self.presets[slot]["key_mode"] = cfg.key_mode
         self.presets[slot].update({attr: getattr(self.output_cfg, attr) for attr in OUTPUT_ATTRS})
         self._save_presets_to_disk()
         self._append_log(f"Preset {slot} saved.")
@@ -875,6 +1265,7 @@ class App:
             "text_color_bgr": self.text_color_swatch,
             "shadow_color_bgr": self.color_swatch,
             "box_color_bgr": self.box_color_swatch,
+            "key_color_bgr": self.key_color_swatch,
         }
         for attr, swatch in color_swatches.items():
             color = preset.get(attr)
@@ -885,7 +1276,13 @@ class App:
         if "box_enabled" in preset:
             self.live_cfg.box_enabled = bool(preset["box_enabled"])
             self.box_enabled_var.set(self.live_cfg.box_enabled)
+        if "key_mode" in preset:
+            self._set_key_mode(preset["key_mode"])
         self._apply_output_values(preset)
+        self._update_source_card()
+        self._update_text_card()
+        self._update_background_card()
+        self._update_output_card()
         self._append_log(f"Preset {slot} applied.")
 
     def _apply_output_values(self, values):
@@ -1007,7 +1404,9 @@ class App:
                 if now - last_preview >= PREVIEW_INTERVAL_S:
                     # The preview always shows the output canvas result, even when
                     # muted (only the NDI output actually sent becomes transparent).
-                    self.msg_queue.put(("preview", (canvas.copy(), muted_now)))
+                    # The raw (pre-key) frame rides along so the eyedropper can
+                    # sample the true, unprocessed background color.
+                    self.msg_queue.put(("preview", (canvas.copy(), muted_now, frame[:, :, :3].copy())))
                     last_preview = now
                 if now - last_info >= INFO_INTERVAL_S:
                     self.msg_queue.put(
@@ -1040,18 +1439,24 @@ class App:
                 elif kind == "status":
                     self.status_var.set(payload)
                 elif kind == "preview":
-                    frame, muted = payload
-                    self._update_preview(frame, muted)
+                    frame, muted, raw_bgr = payload
+                    self.last_raw_bgr = raw_bgr
+                    if self.picking_color:
+                        self._render_picking_preview()
+                    else:
+                        self._update_preview(frame, muted)
                 elif kind == "input_info":
                     xres, yres, fr = payload
                     if xres and yres:
                         fps_s = self._fmt_fps(*fr) if fr and fr[1] else "—"
                         self.input_info_var.set(f"Input: {xres}x{yres} @ {fps_s} fps")
+                        self._update_source_card()
                 elif kind == "stopped":
                     self._set_running_visual(False)
                     self.source_combo.config(state="readonly")
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
+                    self._update_source_card()
                 elif kind == "update_checked":
                     status, detail = payload
                     self._on_update_checked(status, detail)
@@ -1069,6 +1474,7 @@ class App:
         if names and self.source_combo.current() < 0:
             self.source_combo.current(0)
         self._append_log(f"{len(names)} source(s) found.")
+        self._update_source_card()
 
     def _append_log(self, text):
         self.log_lines.append(text)

@@ -1,4 +1,5 @@
-"""Black-background (luma) keying + drop shadow, producing straight-alpha BGRA."""
+"""Background keying (luma or a picked color) + drop shadow, producing
+straight-alpha BGRA."""
 
 from dataclasses import dataclass
 
@@ -38,11 +39,24 @@ class OutputConfig:
 
 @dataclass
 class KeyerConfig:
+    # Which method turns the background into alpha: "luma" (black/white level
+    # below) or "color" (distance from key_color_bgr below).
+    key_mode: str = "luma"
+
     # Black/white level (0-255) used to map luminance -> alpha.
     # Pixels with luma <= black_level become 100% transparent;
     # pixels with luma >= white_level become 100% opaque; smooth ramp between.
     black_level: float = 8.0
     white_level: float = 235.0
+
+    # "color" mode: background color to subtract (BGR), and the color-distance
+    # ramp (in BGR Euclidean units, 0-441.7) that maps to alpha. Pixels within
+    # key_similarity of key_color_bgr become 100% transparent; pixels farther
+    # than key_similarity + key_smoothness become 100% opaque; smooth ramp
+    # between.
+    key_color_bgr: tuple = (0, 0, 0)
+    key_similarity: float = 30.0
+    key_smoothness: float = 60.0
 
     # Shadow offset in pixels (in the resolution of the received frame).
     shadow_dx: float = 3.0
@@ -103,11 +117,16 @@ def process_frame(frame_bgrx, cfg: KeyerConfig) -> np.ndarray:
 
     bgr = frame_bgrx[:, :, :3].astype(np.float32)
 
-    # Perceptual luminance (Rec.601 weights, BGR order).
-    luma = 0.114 * bgr[:, :, 0] + 0.587 * bgr[:, :, 1] + 0.299 * bgr[:, :, 2]
-
-    span = max(1e-6, cfg.white_level - cfg.black_level)
-    fg_a = np.clip((luma - cfg.black_level) / span, 0.0, 1.0)  # HxW, 0..1
+    if cfg.key_mode == "color":
+        key_color = np.asarray(cfg.key_color_bgr, dtype=np.float32)
+        dist = np.sqrt(np.sum((bgr - key_color[None, None, :]) ** 2, axis=2))
+        span = max(1e-6, cfg.key_smoothness)
+        fg_a = np.clip((dist - cfg.key_similarity) / span, 0.0, 1.0)  # HxW, 0..1
+    else:
+        # Perceptual luminance (Rec.601 weights, BGR order).
+        luma = 0.114 * bgr[:, :, 0] + 0.587 * bgr[:, :, 1] + 0.299 * bgr[:, :, 2]
+        span = max(1e-6, cfg.white_level - cfg.black_level)
+        fg_a = np.clip((luma - cfg.black_level) / span, 0.0, 1.0)  # HxW, 0..1
 
     # Shadow mask: same shape as the text, offset and blurred.
     shadow_a = _shift(fg_a, cfg.shadow_dx, cfg.shadow_dy)

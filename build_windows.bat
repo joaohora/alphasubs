@@ -13,9 +13,20 @@ cd /d "%~dp0"
 if not exist .venv (
     echo Creating virtual environment...
     python -m venv .venv
+    if errorlevel 1 goto :error
+)
+
+if not exist .venv\Scripts\activate.bat (
+    echo.
+    echo ERROR: .venv exists but looks incomplete (missing Scripts\activate.bat^).
+    echo This usually means a previous run was interrupted. Delete it and retry:
+    echo   rmdir /s /q .venv
+    echo   build_windows.bat
+    goto :error
 )
 
 call .venv\Scripts\activate.bat
+if errorlevel 1 goto :error
 
 echo Installing dependencies...
 pip install -r requirements.txt
@@ -23,6 +34,8 @@ if errorlevel 1 goto :error
 
 echo Building AlphaSubs.exe...
 pyinstaller --noconfirm --onefile --windowed --name AlphaSubs ^
+    --icon assets\icon.ico ^
+    --add-data "assets\icon.png;assets" ^
     --collect-all NDIlib ^
     --collect-all cv2 ^
     src\gui.py

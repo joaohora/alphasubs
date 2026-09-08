@@ -7,6 +7,7 @@ __pycache__/
 build/
 dist/
 *.spec
+*.exe
 
 # User-specific local state (kept out of the repo on purpose)
 .DS_Store

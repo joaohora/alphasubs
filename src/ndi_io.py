@@ -1,5 +1,6 @@
 """Thin wrapper around the NDIlib bindings: source discovery, receiving, sending."""
 
+import cv2
 import numpy as np
 import NDIlib as ndi
 
@@ -70,6 +71,19 @@ class Receiver:
             self.last_yres = video.yres
             self.last_frame_rate = (video.frame_rate_N, video.frame_rate_D)
             ndi.recv_free_video_v2(self._recv, video)
+
+            # The receiver is configured for BGRX_BGRA, which the NDI SDK
+            # guarantees regardless of the source's native format — but some
+            # ndi-python builds (seen on Windows) hand back the raw UYVY
+            # (4:2:2, 2 bytes/pixel) buffer instead for sources with no alpha
+            # channel. Convert it here rather than crash further down the
+            # pipeline, which expects 4-channel BGRA/BGRX.
+            if frame.ndim == 3 and frame.shape[2] == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGRA_UYVY)
+            elif frame.ndim != 3 or frame.shape[2] != 4:
+                raise ValueError(
+                    f"Unexpected NDI video frame shape {frame.shape} (expected HxWx4 BGRA/BGRX)."
+                )
             return frame
 
         if frame_type == ndi.FRAME_TYPE_AUDIO:
