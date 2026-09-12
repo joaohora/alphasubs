@@ -14,29 +14,57 @@ def shutdown():
     ndi.destroy()
 
 
+class Finder:
+    """Long-lived NDI source finder.
+
+    The underlying NDIlib finder accumulates every source it has seen since
+    it was created, which is how tools like NDI Studio Monitor manage to
+    discover sources that take a few seconds to announce themselves (a
+    different subnet, a source that just started, ...): they keep a single
+    finder alive and poll it repeatedly instead of recreating it. Create one
+    Finder and keep calling poll() on it for as long as discovery is needed,
+    rather than making a fresh Finder per search.
+    """
+
+    def __init__(self):
+        self._finder = ndi.find_create_v2()
+        if self._finder is None:
+            raise RuntimeError("Failed to create the NDI source finder.")
+
+    def poll(self, timeout_ms=1000):
+        """Waits up to timeout_ms for new source announcements, then returns
+        the full list of sources known so far (accumulated since this
+        Finder was created)."""
+        ndi.find_wait_for_sources(self._finder, timeout_ms)
+        return list(ndi.find_get_current_sources(self._finder))
+
+    def close(self):
+        ndi.find_destroy(self._finder)
+
+
 def find_sources(timeout_ms=3000):
     """Blocks for up to timeout_ms searching for NDI sources on the network and
     returns the list found."""
-    finder = ndi.find_create_v2()
-    if finder is None:
-        raise RuntimeError("Failed to create the NDI source finder.")
+    finder = Finder()
     try:
-        ndi.find_wait_for_sources(finder, timeout_ms)
-        sources = list(ndi.find_get_current_sources(finder))
+        return finder.poll(timeout_ms)
     finally:
-        ndi.find_destroy(finder)
-    return sources
+        finder.close()
 
 
-def find_source_by_name(name_substring, timeout_ms=5000, rounds=5):
-    """Searches repeatedly until it finds a source whose name contains
-    name_substring (case-insensitive)."""
+def find_source_by_name(name_substring, timeout_ms=1000, rounds=10):
+    """Searches repeatedly (on a single, reused Finder) until it finds a
+    source whose name contains name_substring (case-insensitive)."""
     needle = name_substring.lower()
-    for _ in range(rounds):
-        for src in find_sources(timeout_ms):
-            if needle in src.ndi_name.lower():
-                return src
-    return None
+    finder = Finder()
+    try:
+        for _ in range(rounds):
+            for src in finder.poll(timeout_ms):
+                if needle in src.ndi_name.lower():
+                    return src
+        return None
+    finally:
+        finder.close()
 
 
 class Receiver:

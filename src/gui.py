@@ -140,12 +140,17 @@ class App:
         self.output_cfg = self._load_output_defaults()
 
         ndi_io.initialize()
+        self._source_finder = ndi_io.Finder()
+        self._sources_stop_event = threading.Event()
+        self._sources_thread = threading.Thread(
+            target=self._sources_worker_loop, daemon=True
+        )
 
         self._apply_theme()
         self._build_scroll_container()
         self._build_ui()
         self._lock_window_size()
-        self._refresh_sources()
+        self._sources_thread.start()
         self.root.after(80, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress-m>", self._toggle_mute)
@@ -1321,17 +1326,25 @@ class App:
     # ---------- NDI sources ----------
 
     def _refresh_sources(self):
+        # Discovery runs continuously in the background (see
+        # _sources_worker_loop): the source list is refreshed automatically
+        # as new sources announce themselves, so there is nothing extra to
+        # trigger here besides reassuring the user something is happening.
         self.msg_queue.put(("log", "Searching for NDI sources..."))
 
-        def worker():
+    def _sources_worker_loop(self):
+        """Runs for the whole app session on a single, persistent NDI
+        Finder, so sources that take a few seconds to announce themselves
+        (different subnet, just started, ...) still show up instead of being
+        missed by a one-shot, short discovery window."""
+        while not self._sources_stop_event.is_set():
             try:
-                sources = ndi_io.find_sources(2000)
+                sources = self._source_finder.poll(1500)
             except Exception as e:
                 self.msg_queue.put(("log", f"Error searching for sources: {e}"))
-                return
+                self._sources_stop_event.wait(2.0)
+                continue
             self.msg_queue.put(("sources", sources))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- Start/Stop ----------
 
@@ -1468,12 +1481,25 @@ class App:
         self.root.after(80, self._poll_queue)
 
     def _set_sources(self, sources):
+        previous_idx = self.source_combo.current()
+        selected_name = (
+            self.sources[previous_idx].ndi_name
+            if 0 <= previous_idx < len(self.sources)
+            else None
+        )
+        previous_names = {s.ndi_name for s in self.sources}
+
         self.sources = sources
         names = [s.ndi_name for s in sources]
         self.source_combo["values"] = names
-        if names and self.source_combo.current() < 0:
+
+        if selected_name in names:
+            self.source_combo.current(names.index(selected_name))
+        elif names and self.source_combo.current() < 0:
             self.source_combo.current(0)
-        self._append_log(f"{len(names)} source(s) found.")
+
+        if {s.ndi_name for s in sources} != previous_names:
+            self._append_log(f"{len(names)} source(s) found.")
         self._update_source_card()
 
     def _append_log(self, text):
@@ -1627,6 +1653,10 @@ class App:
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
             self.worker.join(timeout=2.0)
+        self._sources_stop_event.set()
+        if self._sources_thread.is_alive():
+            self._sources_thread.join(timeout=2.0)
+        self._source_finder.close()
         ndi_io.shutdown()
         self.root.destroy()
 
