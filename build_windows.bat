@@ -36,6 +36,7 @@ echo Building AlphaSubs.exe...
 pyinstaller --noconfirm --onefile --windowed --name AlphaSubs ^
     --icon assets\icon.ico ^
     --add-data "assets\icon.png;assets" ^
+    --add-data "VERSION;." ^
     --collect-all NDIlib ^
     --collect-all cv2 ^
     src\gui.py

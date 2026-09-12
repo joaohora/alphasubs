@@ -83,9 +83,21 @@ BUTTON_KINDS = {
 BUTTON_RADIUS = 3
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GIT_REMOTE = "origin"
+GIT_BRANCH = "main"
+
+
+def _bundle_base_dir():
+    # In a PyInstaller --onefile build, bundled data (see --add-data in
+    # build_windows.bat) is unpacked next to sys._MEIPASS at runtime instead
+    # of living under REPO_ROOT.
+    return Path(getattr(sys, "_MEIPASS", REPO_ROOT))
+
+
 def _load_version():
     try:
-        path = Path(__file__).resolve().parent.parent / "VERSION"
+        path = _bundle_base_dir() / "VERSION"
         lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         version = lines[0] if len(lines) > 0 else "0.0.0"
         release_date = lines[1] if len(lines) > 1 else ""
@@ -96,17 +108,9 @@ def _load_version():
 
 APP_VERSION, APP_RELEASE_DATE = _load_version()
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-GIT_REMOTE = "origin"
-GIT_BRANCH = "main"
-
 
 def _icon_path():
-    # In a PyInstaller --onefile build, bundled data (see --add-data in
-    # build_windows.bat) is unpacked next to sys._MEIPASS at runtime instead
-    # of living under REPO_ROOT.
-    base = Path(getattr(sys, "_MEIPASS", REPO_ROOT))
-    return base / "assets" / "icon.png"
+    return _bundle_base_dir() / "assets" / "icon.png"
 
 
 class App:
