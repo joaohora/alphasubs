@@ -112,7 +112,9 @@ card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
   - *Local (Whisper, offline)*: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
     for recognition plus offline [Argos Translate](https://github.com/argosopentech/argos-translate)
     models for translation. `auto` uses `large-v3-turbo` on an NVIDIA GPU
-    and `small` on the CPU. The models download once, on first Start
+    and `base` on the CPU (`small` is more accurate, but on a CPU it runs
+    the captions 3.5–6 s behind). The status bar shows the time per
+    recognition pass ("s/pass") so you can see whether the machine keeps up. The models download once, on first Start
     (Whisper ~1.6 GB for turbo, ~100 MB per translation pair), into
     `~/.alphasubs_models`. After that it works without internet.
   - *Cloud (Azure Speech)*: Azure AI Speech translation (streaming, lower
@@ -144,7 +146,13 @@ captions keep working. Open the **VOICE** card:
   system, Dante...), and/or **send it as the audio of the NDI output**: the
   same NDI source then carries the captions (video + alpha) and the voice
   (48 kHz stereo).
+- **Voice language:** *Same as subtitles*, or a different one (e.g. captions
+  in Portuguese and voice in English). It is translated from the recognized
+  original, not from the captions.
 - **Speed / Volume:** adjustable live.
+- **Audio buffer (ms):** default 200. It covers the moments when the
+  machine is busy (recognition, synthesis, video). If the voice breaks up,
+  raise it; it adds that much delay. Applies on Start.
 
 The voice speaks whole sentences, so it starts about 1.5–2.5 s after each
 sentence ends. When a backlog builds up during long speeches, it speeds up,

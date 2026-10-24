@@ -22,7 +22,16 @@ from xml.sax.saxutils import escape
 import numpy as np
 
 NDI_RATE = 48000
-NDI_BLOCK_S = 0.02
+PIPER_THREADS = 2
+# The voice's output buffer (VoiceTuning.buffer_ms) has to absorb the moments
+# when the audio threads can't run: in one Python process, recognition,
+# synthesis, the video output and the UI each hold the interpreter (GIL) for
+# 20-60 ms at times, occasionally more. Device output: requested as the
+# stream latency. NDI: the audio frame size, with SDK clocking — the SDK
+# sends each frame exactly one frame-duration after the previous one, so the
+# thread has a whole frame of slack to deliver the next, and receivers see
+# evenly timestamped audio.
+BUFFER_MS_DEFAULT = 200
 VOICES_DIR = Path.home() / ".alphasubs_models" / "voices"
 PIPER_VOICES_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 ESPEAK_MAX_PATH = 120
@@ -51,6 +60,11 @@ def voices_for(engine, lang):
 class VoiceSettings:
     engine: str = "off"  # "off" | "local" | "azure"
     voice: str = ""
+    # Language the voice speaks (may differ from the captions'). When the
+    # recognizer didn't already provide it, the source text is translated
+    # offline; `source_langs` are the spoken languages to preload for that.
+    lang: str = "pt"
+    source_langs: tuple = ()
     device_index: int = None  # audio output device, or None
     ndi: bool = False  # also send the voice as the NDI output's audio
     azure_key: str = ""
@@ -59,9 +73,10 @@ class VoiceSettings:
 
 @dataclass
 class VoiceTuning:
-    """Live-adjustable while running (bound to GUI sliders)."""
+    """Bound to GUI sliders. speed/volume apply live; buffer_ms on Start."""
     speed: float = 1.0
     volume: float = 1.0
+    buffer_ms: float = BUFFER_MS_DEFAULT
 
 
 def _resample(x, in_rate, out_rate):
@@ -119,6 +134,17 @@ class _PiperSynth:
         if not model.is_file() or not model.with_suffix(".onnx.json").is_file():
             _download_piper_voice(name, log)
         self._voice = PiperVoice.load(str(model), espeak_data_dir=_espeak_data_dir())
+        # Piper's ONNX session uses every core by default; during each
+        # sentence's synthesis that starved the audio output threads (gaps
+        # heard as cuts). Two threads is still ~20x faster than real time.
+        import onnxruntime
+
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = PIPER_THREADS
+        opts.inter_op_num_threads = 1
+        self._voice.session = onnxruntime.InferenceSession(
+            str(model), sess_options=opts, providers=["CPUExecutionProvider"]
+        )
         self.rate = self._voice.config.sample_rate
 
     def synth(self, text, speed):
@@ -195,6 +221,7 @@ class VoiceOutput:
         self.settings = settings
         self.tuning = tuning
         self.log = log
+        self._buffer_s = max(0.02, tuning.buffer_ms / 1000.0)
         self._sender = ndi_sender if settings.ndi else None
         self._texts = queue.Queue()
         self._buffers = []
@@ -218,7 +245,7 @@ class VoiceOutput:
             channels = min(2, int(info["max_output_channels"]))
             self._stream = sd.OutputStream(
                 device=s.device_index, samplerate=rate, channels=channels, dtype="float32",
-                blocksize=int(rate * 0.02), callback=self._device_callback,
+                latency=self._buffer_s, callback=self._device_callback,
             )
             self._stream.start()
         for t in self._threads:
@@ -232,38 +259,68 @@ class VoiceOutput:
             self._stream.stop()
             self._stream.close()
 
-    def say(self, text):
-        self._texts.put((time.monotonic(), text))
+    def say(self, info):
+        """Queues one final sentence: the `info` dict from the speech
+        engine (see speech.py), so the voice can speak its own language."""
+        self._texts.put((time.monotonic(), info))
 
     def _pending_s(self):
         audio = max((b.seconds() for b in self._buffers), default=0.0)
         with self._texts.mutex:
-            queued = sum(len(text) for _t, text in self._texts.queue)
+            queued = sum(len(info.get("source", "")) for _t, info in self._texts.queue)
         return audio + queued / CHARS_PER_S
+
+    def _translator(self, src):
+        if src not in self._translators:
+            from translator import Translator
+
+            self._translators[src] = Translator(src, self.settings.lang, log=self.log)
+        return self._translators[src]
+
+    def _text_for(self, info):
+        """The sentence in the voice's language: as provided by the
+        recognizer, the source itself, or translated offline from it."""
+        lang = self.settings.lang
+        text = info.get("texts", {}).get(lang)
+        if text:
+            return text
+        src, source = info.get("lang"), info.get("source", "")
+        if not source:
+            return ""
+        if src == lang:
+            return source
+        return self._translator(src).translate(source)
 
     def _synth_loop(self):
         s = self.settings
+        self._translators = {}
         try:
             if s.engine == "azure":
                 synth = _AzureSynth(s.voice, s.azure_key, s.azure_region)
             else:
                 synth = _PiperSynth(s.voice, self.log)
-            self.log(f"Voice ready ({s.voice}).")
+            for src in s.source_langs:
+                if src != s.lang:
+                    self._translator(src)  # load (and download) now, not on the first sentence
+            self.log(f"Voice ready ({s.voice}, speaking {s.lang}).")
         except Exception as e:
             self.log(f"Voice error: {e}")
             return
         while not self._stop.is_set():
             try:
-                queued_at, text = self._texts.get(timeout=0.2)
+                queued_at, info = self._texts.get(timeout=0.2)
             except queue.Empty:
                 continue
             waited = time.monotonic() - queued_at
             buffered = max((b.seconds() for b in self._buffers), default=0.0)
             if waited + buffered > MAX_LAG_S:
-                self.log(f"Voice too far behind — skipped: {text[:60]}")
+                self.log(f"Voice too far behind — skipped: {info.get('source', '')[:60]}")
                 continue
             speed = self.tuning.speed * (SPEEDUP if self._pending_s() > SPEEDUP_LAG_S else 1.0)
             try:
+                text = self._text_for(info)
+                if not text:
+                    continue
                 pcm = synth.synth(text, speed)
             except Exception as e:
                 self.log(f"Voice error: {e}")
@@ -277,8 +334,10 @@ class VoiceOutput:
 
     def _ndi_loop(self):
         """Sends a continuous 48 kHz stereo stream (silence between
-        sentences), paced in real time, so receivers see steady audio."""
-        n = int(NDI_RATE * NDI_BLOCK_S)
+        sentences) in frames of the buffer size. With SDK clocking each
+        send blocks until its slot, which paces the loop; without it (old
+        NDI bindings), the loop paces itself."""
+        n = int(NDI_RATE * self._buffer_s)
         next_t = time.perf_counter()
         while not self._stop.is_set():
             block = np.clip(self._ndi_buf.read(n) * self.tuning.volume, -1.0, 1.0)
@@ -287,9 +346,10 @@ class VoiceOutput:
             except Exception as e:
                 self.log(f"NDI audio error: {e}")
                 return
-            next_t += NDI_BLOCK_S
-            delay = next_t - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            elif delay < -0.5:
-                next_t = time.perf_counter()
+            if not self._sender.audio_clocked:
+                next_t += n / NDI_RATE
+                delay = next_t - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                elif delay < -0.5:
+                    next_t = time.perf_counter()

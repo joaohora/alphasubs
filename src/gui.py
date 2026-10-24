@@ -71,9 +71,10 @@ LEVEL_INTERVAL_S = 0.1
 AUDIO_PREF_KEYS = (
     "input_mode", "device_label", "channel", "source_lang", "target_lang",
     "engine", "whisper_model", "hotwords", "azure_key", "azure_region",
-    "voice_engine", "voice_name", "voice_device_label", "voice_ndi",
+    "voice_engine", "voice_name", "voice_device_label", "voice_ndi", "voice_lang",
 )
 VOICE_ENGINE_LABELS = {"off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)"}
+VOICE_LANG_LABELS = {"same": "Same as subtitles", "pt": "Português", "en": "English"}
 NO_DEVICE_LABEL = "None"
 POS_RANGE = 1000
 BOX_SIZE_MAX = 3840
@@ -182,10 +183,13 @@ class App:
             tts.VoiceTuning(
                 speed=float(self.audio_prefs.get("voice_speed", 1.0)),
                 volume=float(self.audio_prefs.get("voice_volume", 1.0)),
+                buffer_ms=float(self.audio_prefs.get("voice_buffer_ms", tts.BUFFER_MS_DEFAULT)),
             )
             if tts else None
         )
         self._lock_while_running = []  # (widget, state to restore) for input settings
+        self._monitor = None  # meter-only audio capture while stopped
+        self._monitor_gen = 0
 
         ndi_io.initialize()
         self._source_finder = ndi_io.Finder()
@@ -415,7 +419,10 @@ class App:
         self.background_card_var = tk.StringVar(value="")
         self.output_card_var = tk.StringVar(value="")
 
-        self._make_module_card(row, self.source_title_var, self.source_card_var, self._open_source_panel).pack(side="left")
+        self._make_module_card(
+            row, self.source_title_var, self.source_card_var, self._open_source_panel,
+            extra=self._add_source_card_meter,
+        ).pack(side="left")
         self._make_arrow(row).pack(side="left", padx=4)
         self._make_module_card(row, "TEXT", self.text_card_var, self._open_text_panel).pack(side="left")
         self._make_arrow(row).pack(side="left", padx=4)
@@ -430,6 +437,16 @@ class App:
         self.voice_card_var = tk.StringVar(value="")
         tk.Label(row, text="+", bg=BG, fg=MUTED_FG, font=(self.font_family, 18, "bold")).pack(side="left", padx=4)
         self._make_module_card(row, "VOICE", self.voice_card_var, self._open_voice_panel).pack(side="left")
+
+    def _add_source_card_meter(self, inner):
+        """Extra content for the input card: a small input level meter, shown
+        in the audio mode so the signal can be checked at a glance (also
+        before Start)."""
+        self.card_level_canvas = tk.Canvas(
+            inner, width=LEVEL_METER_W, height=6, bg=FIELD_BG,
+            highlightthickness=1, highlightbackground=BORDER,
+        )
+        self.card_level_bar = self.card_level_canvas.create_rectangle(0, 0, 0, 8, fill=PLAY_BG, width=0)
 
     def _add_background_card_checkbox(self, inner):
         """Extra content for the BACKGROUND card: the Enabled checkbox, right
@@ -494,6 +511,10 @@ class App:
         return card
 
     def _update_source_card(self):
+        if self.input_mode == "audio":
+            self.card_level_canvas.pack(anchor="w", pady=(4, 0))
+        else:
+            self.card_level_canvas.pack_forget()
         if self.input_mode == "audio":
             self.source_title_var.set("AUDIO INPUT")
             device = self.audio_device_var.get().strip() or "No device selected"
@@ -636,7 +657,9 @@ class App:
         ch_row.grid(row=1, column=1, sticky="we", padx=4, pady=2)
         ttk.Label(frame, text="Channel:").grid(row=1, column=0, sticky="w", pady=2)
         self.audio_channel_var = tk.StringVar(value=prefs.get("channel", CHANNEL_MIX_LABEL))
-        self.audio_channel_combo = combo(ch_row, self.audio_channel_var, [CHANNEL_MIX_LABEL], 10)
+        self.audio_channel_combo = combo(
+            ch_row, self.audio_channel_var, [CHANNEL_MIX_LABEL], 10, lambda e: self._restart_monitor()
+        )
         self.audio_channel_combo.pack(side="left")
         ttk.Label(ch_row, text="   Level:").pack(side="left")
         self.level_canvas = tk.Canvas(
@@ -645,6 +668,8 @@ class App:
         )
         self.level_canvas.pack(side="left", padx=6)
         self.level_bar = self.level_canvas.create_rectangle(0, 0, 0, LEVEL_METER_H + 2, fill=PLAY_BG, width=0)
+        self.level_text_var = tk.StringVar(value="— dB")
+        ttk.Label(ch_row, textvariable=self.level_text_var, foreground=MUTED_FG, width=8).pack(side="left")
 
         lang_row = ttk.Frame(frame)
         lang_row.grid(row=2, column=1, columnspan=2, sticky="we", padx=4, pady=2)
@@ -673,7 +698,7 @@ class App:
         self.whisper_model_var = tk.StringVar(value=prefs.get("whisper_model", "auto"))
         combo(self.local_engine_frame, self.whisper_model_var, list(WHISPER_MODELS), 14).pack(side="left", padx=6)
         ttk.Label(
-            self.local_engine_frame, text="auto = large-v3-turbo on NVIDIA GPU, small on CPU",
+            self.local_engine_frame, text="auto = large-v3-turbo on NVIDIA GPU, base on CPU (small: better, slower)",
             foreground=MUTED_FG,
         ).pack(side="left", padx=6)
 
@@ -721,6 +746,7 @@ class App:
             return
         self.input_mode = mode
         self._show_input_mode_frames()
+        self._restart_monitor()
 
     def _show_input_mode_frames(self):
         """Shows the input settings and TEXT panel sections that apply to
@@ -766,6 +792,8 @@ class App:
         if rescan and self.worker and self.worker.is_alive():
             self._append_log("Stop the pipeline before rescanning audio devices.")
             return
+        if rescan:
+            self._stop_monitor()  # rescanning restarts PortAudio under open streams
         try:
             self.audio_devices = audio_io.list_input_devices(rescan=rescan)
         except Exception as e:
@@ -795,6 +823,50 @@ class App:
         if self.audio_channel_var.get() not in values:
             self.audio_channel_var.set(CHANNEL_MIX_LABEL)
         self._update_source_card()
+        self._restart_monitor()
+
+    # ---------- Input level monitor (before Start) ----------
+
+    def _restart_monitor(self):
+        """While the audio mode is selected and stopped, keeps a meter-only
+        capture of the selected device/channel open, so the operator can
+        check the signal before pressing Start. While running, the meter
+        follows the engine's own capture instead."""
+        self._stop_monitor()
+        if audio_io is None or self.input_mode != "audio" or (self.worker and self.worker.is_alive()):
+            return
+        device_index, _max_ch = self._selected_audio_device()
+        if device_index is None:
+            return
+        channel = self.audio_channel_var.get()
+        try:
+            self._monitor = audio_io.AudioCapture(
+                device_index, None if channel == CHANNEL_MIX_LABEL else int(channel) - 1, meter_only=True
+            )
+            self._monitor.start()
+        except Exception as e:
+            self._monitor = None
+            self._append_log(f"Could not open '{self.audio_device_var.get()}' for the level meter: {e}")
+            return
+        self._monitor_gen += 1
+        self._poll_monitor(self._monitor_gen)
+
+    def _stop_monitor(self):
+        monitor, self._monitor = getattr(self, "_monitor", None), None
+        if monitor is not None:
+            try:
+                monitor.close()
+            except Exception:
+                pass
+        if hasattr(self, "level_canvas"):
+            self._update_level_meter(-120.0)
+
+    def _poll_monitor(self, gen):
+        # `gen` ends the polling chain of a monitor that has been replaced.
+        if self._monitor is None or gen != self._monitor_gen:
+            return
+        self._update_level_meter(self._monitor.level_db)
+        self.root.after(int(LEVEL_INTERVAL_S * 1000), self._poll_monitor, gen)
 
     def _speech_settings(self):
         device_index, _max_ch = self._selected_audio_device()
@@ -816,8 +888,13 @@ class App:
     def _update_level_meter(self, level_db):
         frac = min(1.0, max(0.0, (level_db + 60.0) / 60.0))
         color = REC_BG if level_db > -6.0 else PLAY_BG
-        self.level_canvas.coords(self.level_bar, 0, 0, frac * LEVEL_METER_W, LEVEL_METER_H + 2)
-        self.level_canvas.itemconfig(self.level_bar, fill=color)
+        for canvas, bar, h in (
+            (self.level_canvas, self.level_bar, LEVEL_METER_H),
+            (self.card_level_canvas, self.card_level_bar, 6),
+        ):
+            canvas.coords(bar, 0, 0, frac * LEVEL_METER_W, h + 2)
+            canvas.itemconfig(bar, fill=color)
+        self.level_text_var.set(f"{level_db:.0f} dB" if level_db > -100 else "— dB")
 
     def _set_input_settings_locked(self, locked):
         for widget, state in self._lock_while_running:
@@ -857,32 +934,42 @@ class App:
             row=0, column=1, sticky="w", padx=4, pady=2
         )
 
-        ttk.Label(frame, text="Speaker:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Voice language:").grid(row=1, column=0, sticky="w", pady=2)
+        self.voice_lang_var = tk.StringVar(
+            value=VOICE_LANG_LABELS.get(prefs.get("voice_lang"), VOICE_LANG_LABELS["same"])
+        )
+        combo(self.voice_lang_var, list(VOICE_LANG_LABELS.values()), 18, self._on_voice_engine_change).grid(
+            row=1, column=1, sticky="w", padx=4, pady=2
+        )
+
+        ttk.Label(frame, text="Speaker:").grid(row=2, column=0, sticky="w", pady=2)
         self.voice_name_var = tk.StringVar(value=prefs.get("voice_name", ""))
         self.voice_name_combo = combo(self.voice_name_var, [], 28, lambda e: self._update_voice_card())
-        self.voice_name_combo.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        self.voice_name_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(frame, text="Output device:").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Output device:").grid(row=3, column=0, sticky="w", pady=2)
         self.voice_device_var = tk.StringVar(value=prefs.get("voice_device_label", NO_DEVICE_LABEL))
         self.voice_device_combo = combo(self.voice_device_var, [NO_DEVICE_LABEL], 42, lambda e: self._update_voice_card())
-        self.voice_device_combo.grid(row=2, column=1, sticky="we", padx=4, pady=2)
+        self.voice_device_combo.grid(row=3, column=1, sticky="we", padx=4, pady=2)
         self._make_simple_button(
             frame, "Refresh", lambda: self._refresh_audio_devices(rescan=True)
-        ).grid(row=2, column=2, padx=4)
+        ).grid(row=3, column=2, padx=4)
 
         self.voice_ndi_var = tk.BooleanVar(value=bool(prefs.get("voice_ndi", False)))
         ndi_check = ttk.Checkbutton(
             frame, text="Also send it as the audio of the NDI output",
             variable=self.voice_ndi_var, command=self._update_voice_card,
         )
-        ndi_check.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 6))
+        ndi_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 6))
         self._lock_while_running.append((ndi_check, "normal"))
 
         if tts is not None:
-            self._add_slider(frame, 4, "Speed", 0.7, 1.5, self.voice_tuning.speed, "speed",
+            self._add_slider(frame, 5, "Speed", 0.7, 1.5, self.voice_tuning.speed, "speed",
                              decimals=2, target=self.voice_tuning)
-            self._add_slider(frame, 5, "Volume", 0.0, 2.0, self.voice_tuning.volume, "volume",
+            self._add_slider(frame, 6, "Volume", 0.0, 2.0, self.voice_tuning.volume, "volume",
                              decimals=2, target=self.voice_tuning)
+            self._add_slider(frame, 7, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
+                             "buffer_ms", target=self.voice_tuning)
 
         for row, text in enumerate((
             "Speaks whole sentences, a few seconds behind the speaker; it speeds up and skips"
@@ -890,7 +977,8 @@ class App:
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
             "Azure voices use the key and region from the Input panel.",
-        ), start=6):
+            "If the voice still breaks up, raise the audio buffer (it adds that much delay).",
+        ), start=8):
             ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
                 row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0)
             )
@@ -904,8 +992,13 @@ class App:
     def _on_voice_engine_change(self, event=None):
         self._refresh_voice_names()
 
+    def _voice_lang_code(self):
+        """The language the voice speaks ("Same as subtitles" resolved)."""
+        code = next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same")
+        return self._target_lang_code() if code == "same" else code
+
     def _refresh_voice_names(self):
-        names = list(tts.voices_for(self._voice_engine_code(), self._target_lang_code())) if tts else []
+        names = list(tts.voices_for(self._voice_engine_code(), self._voice_lang_code())) if tts else []
         self.voice_name_combo["values"] = names
         if self.voice_name_var.get() not in names:
             self.voice_name_var.set(names[0] if names else "")
@@ -939,7 +1032,8 @@ class App:
         outputs = [o for o, on in (
             ("Device", self.voice_device_var.get() != NO_DEVICE_LABEL), ("NDI", self.voice_ndi_var.get())
         ) if on]
-        self.voice_card_var.set(f"{speaker}\n{' + '.join(outputs) if outputs else 'No output selected'}")
+        where = " + ".join(outputs) if outputs else "No output selected"
+        self.voice_card_var.set(f"{speaker} · {self._voice_lang_code().upper()}\n{where}")
 
     def _voice_settings(self):
         engine = self._voice_engine_code()
@@ -950,9 +1044,12 @@ class App:
         if device_index is None and not self.voice_ndi_var.get():
             self._append_log("Voice is on but has no output (device or NDI) — it won't be heard.")
             return None
+        source = self._source_lang_code()
         return tts.VoiceSettings(
             engine=engine,
             voice=self.voice_name_var.get(),
+            lang=self._voice_lang_code(),
+            source_langs=speech.LANGS if source == "auto" else (source,),
             device_index=device_index,
             ndi=self.voice_ndi_var.get(),
             azure_key=self.azure_key_var.get(),
@@ -1062,6 +1159,12 @@ class App:
             frame, text="Bold", variable=self.caption_bold_var,
             command=lambda: setattr(self.caption_cfg, "bold", self.caption_bold_var.get()),
         ).grid(row=5, column=0, sticky="w", padx=4, pady=(2, 0))
+        self.caption_live_var = tk.BooleanVar(value=cap.live)
+        ttk.Checkbutton(
+            frame, text="Show text while speaking (faster, but it corrects itself on screen)",
+            variable=self.caption_live_var,
+            command=lambda: setattr(self.caption_cfg, "live", self.caption_live_var.get()),
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0))
 
     def _build_background_panel(self):
         win = self._make_panel_window("Background box")
@@ -1738,6 +1841,7 @@ class App:
             if attr in prefs:
                 setattr(cfg, attr, float(prefs[attr]))
         cfg.bold = bool(prefs.get("caption_bold", cfg.bold))
+        cfg.live = bool(prefs.get("caption_live", cfg.live))
         return cfg, prefs
 
     def _save_audio_defaults(self):
@@ -1756,13 +1860,16 @@ class App:
             "voice_name": self.voice_name_var.get(),
             "voice_device_label": self.voice_device_var.get(),
             "voice_ndi": self.voice_ndi_var.get(),
+            "voice_lang": next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same"),
         }
         data = {key: values[key] for key in AUDIO_PREF_KEYS}
         data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         data["caption_bold"] = self.caption_cfg.bold
+        data["caption_live"] = self.caption_cfg.live
         if self.voice_tuning is not None:
             data["voice_speed"] = self.voice_tuning.speed
             data["voice_volume"] = self.voice_tuning.volume
+            data["voice_buffer_ms"] = self.voice_tuning.buffer_ms
         self.presets["_audio"] = data
         self._save_presets_to_disk()
 
@@ -1775,6 +1882,7 @@ class App:
         self.presets[slot].update({attr: getattr(self.output_cfg, attr) for attr in OUTPUT_ATTRS})
         self.presets[slot].update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         self.presets[slot]["caption_bold"] = self.caption_cfg.bold
+        self.presets[slot]["caption_live"] = self.caption_cfg.live
         self._save_presets_to_disk()
         self._append_log(f"Preset {slot} saved.")
 
@@ -1789,6 +1897,9 @@ class App:
         if "caption_bold" in preset:
             self.caption_cfg.bold = bool(preset["caption_bold"])
             self.caption_bold_var.set(self.caption_cfg.bold)
+        if "caption_live" in preset:
+            self.caption_cfg.live = bool(preset["caption_live"])
+            self.caption_live_var.set(self.caption_cfg.live)
         color_swatches = {
             "text_color_bgr": self.text_color_swatch,
             "shadow_color_bgr": self.color_swatch,
@@ -1889,7 +2000,10 @@ class App:
             if settings is None:
                 self._append_log("Select an audio input device before starting.")
                 return
-            target, args = self._run_audio_pipeline, (settings, self._voice_settings(), output_name)
+            voice_settings = self._voice_settings()
+            if voice_settings is not None and voice_settings.lang != settings.target_lang:
+                settings.extra_target_langs = (voice_settings.lang,)
+            target, args = self._run_audio_pipeline, (settings, voice_settings, output_name)
         else:
             idx = self.source_combo.current()
             if idx < 0 or idx >= len(self.sources):
@@ -1897,6 +2011,7 @@ class App:
                 return
             target, args = self._run_pipeline, (self.sources[idx], output_name)
 
+        self._stop_monitor()  # the engine opens its own capture of the device
         self.stop_event.clear()
         self.source_combo.config(state="disabled")
         self._set_input_settings_locked(True)
@@ -2001,10 +2116,11 @@ class App:
                 post(("log", f"Voice output failed to start: {e}"))
                 voice_out = None
 
-        def on_caption(text, final):
-            board.update(text, final)
-            if final and text and voice_out is not None:
-                voice_out.say(text)
+        def on_caption(text, final, info=None):
+            if final or self.caption_cfg.live:
+                board.update(text, final)
+            if final and info and info.get("source") and voice_out is not None:
+                voice_out.say(info)
 
         engine = speech.create_engine(settings, on_caption, log=lambda m: post(("log", m)), on_status=on_status)
         engine.start()
@@ -2101,6 +2217,7 @@ class App:
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
                     self._update_source_card()
+                    self._restart_monitor()
                 elif kind == "update_checked":
                     status, detail = payload
                     self._on_update_checked(status, detail)
@@ -2280,6 +2397,7 @@ class App:
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _on_close(self):
+        self._stop_monitor()
         self._save_output_defaults()
         self._save_audio_defaults()
         if self.worker and self.worker.is_alive():

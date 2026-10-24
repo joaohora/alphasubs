@@ -103,14 +103,16 @@ class AudioCapture:
     """Captures one input device. `channel` is a 0-based channel index, or
     None to mix the first two channels (mono mics/stereo pairs both work).
     read() returns 16 kHz mono float32 blocks; `level_db` holds the latest
-    input level (dBFS) for a meter."""
+    input level (dBFS) for a meter. With `meter_only`, audio isn't kept at
+    all — only the level is updated (the pre-Start signal check)."""
 
-    def __init__(self, device_index, channel=None):
+    def __init__(self, device_index, channel=None, meter_only=False):
         info = sd.query_devices(device_index)
         max_ch = int(info["max_input_channels"])
         if channel is not None and not 0 <= channel < max_ch:
             raise ValueError(f"Channel {channel + 1} not available (device has {max_ch}).")
         self.channel = channel
+        self.meter_only = meter_only
         n_open = channel + 1 if channel is not None else min(2, max_ch)
         self.native_rate = int(info["default_samplerate"])
         self.level_db = -120.0
@@ -129,6 +131,8 @@ class AudioCapture:
             mono = indata[:, self.channel]
         rms = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
         self.level_db = 20.0 * np.log10(max(rms, 1e-6))
+        if self.meter_only:
+            return
         try:
             self._q.put_nowait(mono.copy())
         except queue.Full:
@@ -138,13 +142,21 @@ class AudioCapture:
         self._stream.start()
 
     def read(self, timeout=0.1):
-        """Returns the next block resampled to 16 kHz (possibly empty), or
-        None if nothing arrived within the timeout."""
+        """Returns ALL audio captured since the last call, resampled to
+        16 kHz (possibly empty), or None if nothing arrived within the
+        timeout. Draining the whole queue matters: a consumer that is slower
+        than real time (e.g. a transcription pass) must catch up on its next
+        read instead of falling further behind one block at a time."""
         try:
-            block = self._q.get(timeout=timeout)
+            blocks = [self._q.get(timeout=timeout)]
         except queue.Empty:
             return None
-        return self._resampler.process(block)
+        while True:
+            try:
+                blocks.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return self._resampler.process(np.concatenate(blocks))
 
     def close(self):
         try:

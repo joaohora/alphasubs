@@ -133,9 +133,18 @@ class Sender:
             # Makes the NDI SDK pace the send calls to the frame_rate_N/D given
             # in each send(), instead of emitting as fast as frames arrive.
             settings.clock_video = clock_video
+        # Audio (the translated voice) relies on SDK clocking: each send waits
+        # until the previous frame's duration has elapsed, so timestamps stay
+        # regular however unevenly the sending thread runs (see voice.py).
+        self.audio_clocked = hasattr(settings, "clock_audio")
+        if self.audio_clocked:
+            settings.clock_audio = True
         self._send = ndi.send_create(settings)
         if self._send is None:
-            raise RuntimeError("Failed to create the NDI sender.")
+            raise RuntimeError(
+                f"Failed to create the NDI sender '{name}' — is another AlphaSubs already "
+                "running with this output name on this machine?"
+            )
         self._frame = ndi.VideoFrameV2()
         self._frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRA
 

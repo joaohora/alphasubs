@@ -42,6 +42,10 @@ class CaptionConfig:
     bottom_margin: float = 80.0
     # Captions are cleared after this many seconds without new speech.
     hold_s: float = 4.0
+    # False: only finished sentences are shown, and never change once up.
+    # True: text also appears while the person speaks, and gets corrected
+    # as recognition improves (faster, but visibly rewrites itself).
+    live: bool = False
 
 
 _font_cache = {}
