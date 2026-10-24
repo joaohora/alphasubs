@@ -1950,9 +1950,11 @@ class App:
         if event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
             return
         self.muted = not self.muted
+        if self.voice_tuning is not None:
+            self.voice_tuning.muted = self.muted
         if self.muted:
             self.mute_btn.set_variant("muted")
-            self._append_log("Mute enabled — NDI output is now fully transparent.")
+            self._append_log("Mute enabled — NDI output is now fully transparent and the voice is silent.")
         else:
             self.mute_btn.set_variant("idle")
             self._append_log("Mute disabled.")

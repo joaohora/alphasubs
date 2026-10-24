@@ -73,10 +73,14 @@ class VoiceSettings:
 
 @dataclass
 class VoiceTuning:
-    """Bound to GUI sliders. speed/volume apply live; buffer_ms on Start."""
+    """Bound to GUI controls. speed/volume/muted apply live; buffer_ms on
+    Start."""
     speed: float = 1.0
     volume: float = 1.0
     buffer_ms: float = BUFFER_MS_DEFAULT
+    # The app's Mute: silences the voice at once (mid-sentence too), and
+    # sentences spoken meanwhile are dropped rather than played later.
+    muted: bool = False
 
 
 def _resample(x, in_rate, out_rate):
@@ -311,6 +315,8 @@ class VoiceOutput:
                 queued_at, info = self._texts.get(timeout=0.2)
             except queue.Empty:
                 continue
+            if self.tuning.muted:
+                continue
             waited = time.monotonic() - queued_at
             buffered = max((b.seconds() for b in self._buffers), default=0.0)
             if waited + buffered > MAX_LAG_S:
@@ -328,8 +334,11 @@ class VoiceOutput:
             for buf in self._buffers:
                 buf.append(_resample(pcm, synth.rate, buf.rate))
 
+    def _gain(self):
+        return 0.0 if self.tuning.muted else self.tuning.volume
+
     def _device_callback(self, outdata, frames, _time_info, _status):
-        block = self._dev_buf.read(frames) * self.tuning.volume
+        block = self._dev_buf.read(frames) * self._gain()
         outdata[:] = np.clip(block, -1.0, 1.0)[:, None]
 
     def _ndi_loop(self):
@@ -340,7 +349,7 @@ class VoiceOutput:
         n = int(NDI_RATE * self._buffer_s)
         next_t = time.perf_counter()
         while not self._stop.is_set():
-            block = np.clip(self._ndi_buf.read(n) * self.tuning.volume, -1.0, 1.0)
+            block = np.clip(self._ndi_buf.read(n) * self._gain(), -1.0, 1.0)
             try:
                 self._sender.send_audio(np.vstack([block, block]), NDI_RATE)
             except Exception as e:
