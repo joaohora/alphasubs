@@ -46,6 +46,8 @@ pyinstaller --noconfirm --onefile --windowed --name AlphaSubs ^
     --collect-all sacremoses ^
     --collect-all subword_nmt ^
     --collect-all azure.cognitiveservices.speech ^
+    --collect-all piper ^
+    --collect-all av ^
     src\gui.py
 REM The CUDA/cuDNN DLLs (for Whisper on an NVIDIA GPU) are NOT bundled: at
 REM ~1 GB they would make the single-file exe very slow to start. To use the

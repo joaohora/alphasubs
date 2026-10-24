@@ -13,33 +13,50 @@ BLOCK_S = 0.05
 SKIPPED_HOSTAPIS = ("Windows WDM-KS",)
 
 
-def list_input_devices(rescan=False):
-    """Returns [(device_index, label, max_input_channels)] for every device
-    with input channels. The label carries the host API (MME/WASAPI/Core
-    Audio/...) since Windows lists the same device once per host API.
-    `rescan` re-initializes PortAudio so devices plugged in after startup
-    show up (only safe while no stream is open)."""
+def _list_devices(channels_key, rescan):
     if rescan:
         sd._terminate()
         sd._initialize()
     hostapis = sd.query_hostapis()
     devices = []
     for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_input_channels"] <= 0:
+        if dev[channels_key] <= 0:
             continue
         api = hostapis[dev["hostapi"]]["name"]
         if api in SKIPPED_HOSTAPIS:
             continue
-        devices.append((idx, f"{dev['name']} ({api})", int(dev["max_input_channels"])))
+        devices.append((idx, f"{dev['name']} ({api})", int(dev[channels_key])))
     return devices
 
 
-def default_input_device():
+def list_input_devices(rescan=False):
+    """Returns [(device_index, label, max_input_channels)] for every device
+    with input channels. The label carries the host API (MME/WASAPI/Core
+    Audio/...) since Windows lists the same device once per host API.
+    `rescan` re-initializes PortAudio so devices plugged in after startup
+    show up (only safe while no stream is open)."""
+    return _list_devices("max_input_channels", rescan)
+
+
+def list_output_devices(rescan=False):
+    """Like list_input_devices(), for devices with output channels."""
+    return _list_devices("max_output_channels", rescan)
+
+
+def _default_device(i):
     try:
-        idx = sd.default.device[0]
+        idx = sd.default.device[i]
     except (TypeError, IndexError):
         return None
     return idx if idx is not None and idx >= 0 else None
+
+
+def default_input_device():
+    return _default_device(0)
+
+
+def default_output_device():
+    return _default_device(1)
 
 
 class _Resampler:

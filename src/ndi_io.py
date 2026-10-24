@@ -150,5 +150,17 @@ class Sender:
         self._frame.frame_rate_D = frame_rate_d
         ndi.send_send_video_v2(self._send, self._frame)
 
+    def send_audio(self, planar_f32, sample_rate=48000):
+        """Sends a block of audio, `planar_f32` shaped (channels, samples).
+        Safe to call from a different thread than send()."""
+        data = np.ascontiguousarray(planar_f32, dtype=np.float32)
+        frame = ndi.AudioFrameV2()
+        frame.sample_rate = sample_rate
+        frame.no_channels = data.shape[0]
+        frame.no_samples = data.shape[1]
+        frame.channel_stride_in_bytes = data.shape[1] * 4
+        frame.data = data
+        ndi.send_send_audio_v2(self._send, frame)
+
     def close(self):
         ndi.send_destroy(self._send)

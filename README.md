@@ -131,6 +131,28 @@ Expected latency is about 1–3 s from speech to caption with the local engine
 (the text appears while the person is still speaking and is refined when
 they pause).
 
+### Translated voice (VOICE module)
+
+In the audio mode, the translated text can also be spoken, while the
+captions keep working. Open the **VOICE** card:
+
+- **Voice:** *Off*, *Local (Piper, offline)*, or *Cloud (Azure neural)*.
+  Azure voices use the key and region from the Input panel.
+- **Speaker:** the voices available for the subtitle language. Local voices
+  (~65 MB each) download once, on first use.
+- **Output device:** a sound card output (headphones, interpretation
+  system, Dante...), and/or **send it as the audio of the NDI output**: the
+  same NDI source then carries the captions (video + alpha) and the voice
+  (48 kHz stereo).
+- **Speed / Volume:** adjustable live.
+
+The voice speaks whole sentences, so it starts about 1.5–2.5 s after each
+sentence ends. When a backlog builds up during long speeches, it speeds up,
+and it skips sentences that would start more than 12 s late.
+
+Keep the voice out of the microphone's reach (don't send it to the room's
+PA), or it will be picked up and translated again.
+
 **GPU on Windows:** `requirements.txt` installs the CUDA 12/cuDNN 9 runtime
 (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`), which the app picks up
 automatically. If the GPU can't be used, it logs why and falls back to the
@@ -158,6 +180,7 @@ src/audio_io.py     # audio input devices + capture (16 kHz mono)
 src/speech.py       # speech engines: local Whisper and Azure Speech
 src/translator.py   # offline EN/ES/PT translation (Argos models via CTranslate2)
 src/captions.py     # caption layout (roll-up lines) and rendering through the keyer
+src/voice.py        # translated voice: Piper/Azure TTS to an output device and/or NDI audio
 src/main.py         # CLI and main loop
 src/gui.py          # Tkinter GUI for operating without a terminal
 build_windows.bat   # builds dist\AlphaSubs.exe via PyInstaller (run on Windows)
