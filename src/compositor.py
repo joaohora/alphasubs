@@ -82,17 +82,27 @@ class KeyerConfig:
     box_pos_y: float = 0.0
 
 
-def _box_mask(shape, cfg):
-    """Builds an HxWx1 float32 alpha mask (0 or box_opacity) for the
-    background box rectangle, sized and positioned per `cfg` within a frame
-    of `shape` = (H, W)."""
+def box_rect(shape, cfg):
+    """(x0, y0, x1, y1) of the background box within a frame of `shape` =
+    (H, W), per `cfg`'s size and position."""
     h, w = shape
     box_w = w if cfg.box_w <= 0 else float(cfg.box_w)
     box_h = h if cfg.box_h <= 0 else float(cfg.box_h)
     cx, cy = w / 2.0, h / 2.0
     x0 = cx - box_w / 2.0 + cfg.box_pos_x
     y0 = cy - box_h / 2.0 - cfg.box_pos_y
-    x1, y1 = x0 + box_w, y0 + box_h
+    return x0, y0, x0 + box_w, y0 + box_h
+
+
+def _box_mask(shape, cfg, full_shape=None, origin=(0, 0)):
+    """Builds an HxWx1 float32 alpha mask (0 or box_opacity) for the
+    background box rectangle, sized and positioned per `cfg` within a frame
+    of `full_shape` (defaults to `shape`) = (H, W). `shape`/`origin` describe
+    the (sub)region actually being processed, as (H, W) and (x, y)."""
+    h, w = shape
+    x0, y0, x1, y1 = box_rect(full_shape or shape, cfg)
+    ox, oy = origin
+    x0, x1, y0, y1 = x0 - ox, x1 - ox, y0 - oy, y1 - oy
 
     cols = np.arange(w, dtype=np.float32)
     rows = np.arange(h, dtype=np.float32)
@@ -111,9 +121,12 @@ def _shift(img_f32, dx, dy):
     )
 
 
-def process_frame(frame_bgrx, cfg: KeyerConfig) -> np.ndarray:
+def process_frame(frame_bgrx, cfg: KeyerConfig, full_shape=None, origin=(0, 0)) -> np.ndarray:
     """frame_bgrx: HxWx4 uint8 (BGRA or BGRX; input alpha channel is ignored).
-    Returns HxWx4 uint8 BGRA with straight (non-premultiplied) alpha."""
+    Returns HxWx4 uint8 BGRA with straight (non-premultiplied) alpha.
+    `frame_bgrx` may be a crop of a larger frame of `full_shape` (H, W) at
+    `origin` (x, y): the background box is then still placed relative to
+    the full frame."""
 
     bgr = frame_bgrx[:, :, :3].astype(np.float32)
 
@@ -139,7 +152,9 @@ def process_frame(frame_bgrx, cfg: KeyerConfig) -> np.ndarray:
     text_color = np.asarray(cfg.text_color_bgr, dtype=np.float32)
     shadow_color = np.asarray(cfg.shadow_color_bgr, dtype=np.float32)
     box_color = np.asarray(cfg.box_color_bgr, dtype=np.float32)
-    box_a = _box_mask(fg_a.shape, cfg) if cfg.box_enabled and cfg.box_opacity > 0 else 0.0
+    box_a = (
+        _box_mask(fg_a.shape, cfg, full_shape, origin) if cfg.box_enabled and cfg.box_opacity > 0 else 0.0
+    )
 
     # Layered "over" compositing in premultiplied space (avoids color fringing
     # at edges): background box, then shadow over the box, then text on top.

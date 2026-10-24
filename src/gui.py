@@ -15,6 +15,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from dataclasses import astuple
 from pathlib import Path
 from tkinter import colorchooser, messagebox, ttk
 
@@ -23,7 +24,17 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
 import ndi_io
+from captions import CaptionBoard, CaptionConfig, load_font, render_keyed_captions
 from compositor import FPS_PRESETS, KeyerConfig, OutputConfig, place_on_canvas, process_frame
+
+try:
+    import audio_io
+    import speech
+except Exception as _e:  # e.g. PortAudio missing: the audio mode is then unavailable
+    audio_io = speech = None
+    AUDIO_IMPORT_ERROR = str(_e)
+else:
+    AUDIO_IMPORT_ERROR = None
 
 APP_NAME = "AlphaSubs"
 
@@ -45,6 +56,21 @@ PRESET_ATTRS = (
 PRESET_COLOR_ATTRS = ("text_color_bgr", "shadow_color_bgr", "box_color_bgr", "key_color_bgr")
 KEY_MODE_LABELS = {"luma": "Black background (luma)", "color": "Custom color"}
 OUTPUT_ATTRS = ("canvas_w", "canvas_h", "fps_n", "fps_d", "scale", "pos_x_px", "pos_y_px")
+CAPTION_ATTRS = ("font_size", "max_lines", "line_width_pct", "bottom_margin", "hold_s")
+
+INPUT_MODE_LABELS = {"ndi": "NDI video (key)", "audio": "Audio (speech-to-text)"}
+SOURCE_LANG_LABELS = {"auto": "Auto (EN / PT / ES)", "en": "English", "pt": "Português", "es": "Español"}
+TARGET_LANG_LABELS = {"pt": "Português", "en": "English"}
+ENGINE_LABELS = {"local": "Local (Whisper, offline)", "azure": "Cloud (Azure Speech)"}
+WHISPER_MODELS = ("auto", "large-v3-turbo", "large-v3", "medium", "small", "base")
+CHANNEL_MIX_LABEL = "Mix (1+2)"
+LEVEL_METER_W, LEVEL_METER_H = 140, 10
+LEVEL_INTERVAL_S = 0.1
+# Audio-mode settings remembered between sessions (in the presets file).
+AUDIO_PREF_KEYS = (
+    "input_mode", "device_label", "channel", "source_lang", "target_lang",
+    "engine", "whisper_model", "hotwords", "azure_key", "azure_region",
+)
 POS_RANGE = 1000
 BOX_SIZE_MAX = 3840
 BOX_POS_RANGE = 1000
@@ -142,6 +168,12 @@ class App:
         self._pick_scale = 1.0
         self.presets = self._load_presets()
         self.output_cfg = self._load_output_defaults()
+        self.caption_cfg, self.audio_prefs = self._load_audio_defaults()
+        self.input_mode = self.audio_prefs.get("input_mode", "ndi")
+        if self.input_mode == "audio" and speech is None:
+            self.input_mode = "ndi"
+        self.audio_devices = []
+        self._lock_while_running = []  # (widget, state to restore) for input settings
 
         ndi_io.initialize()
         self._source_finder = ndi_io.Finder()
@@ -364,11 +396,12 @@ class App:
         row.pack(fill="x", padx=pad["padx"], pady=(10, 6))
 
         self.source_card_var = tk.StringVar(value="No source selected")
+        self.source_title_var = tk.StringVar(value="NDI SOURCE")
         self.text_card_var = tk.StringVar(value="")
         self.background_card_var = tk.StringVar(value="")
         self.output_card_var = tk.StringVar(value="")
 
-        self._make_module_card(row, "NDI SOURCE", self.source_card_var, self._open_source_panel).pack(side="left")
+        self._make_module_card(row, self.source_title_var, self.source_card_var, self._open_source_panel).pack(side="left")
         self._make_arrow(row).pack(side="left", padx=4)
         self._make_module_card(row, "TEXT", self.text_card_var, self._open_text_panel).pack(side="left")
         self._make_arrow(row).pack(side="left", padx=4)
@@ -399,7 +432,8 @@ class App:
         expand=True. `extra`, if given, is called with that inner frame so a
         card can host a small interactive control (e.g. an inline checkbox)
         in addition to its title/summary — that control keeps its own click
-        behavior and doesn't open the panel."""
+        behavior and doesn't open the panel. `title` may be a StringVar, for
+        a card whose title follows the current mode."""
         card = tk.Frame(
             parent, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER,
             cursor="hand2", width=200, height=92,
@@ -409,8 +443,9 @@ class App:
         inner = tk.Frame(card, bg=PANEL_BG)
         inner.pack(expand=True)
 
+        title_kw = {"textvariable": title} if isinstance(title, tk.StringVar) else {"text": title}
         title_lbl = tk.Label(
-            inner, text=title, bg=PANEL_BG, fg=MUTED_FG, font=(self.font_family, 9, "bold"), anchor="w",
+            inner, bg=PANEL_BG, fg=MUTED_FG, font=(self.font_family, 9, "bold"), anchor="w", **title_kw,
         )
         title_lbl.pack(fill="x", pady=(0, 3), anchor="w")
 
@@ -440,6 +475,16 @@ class App:
         return card
 
     def _update_source_card(self):
+        if self.input_mode == "audio":
+            self.source_title_var.set("AUDIO INPUT")
+            device = self.audio_device_var.get().strip() or "No device selected"
+            if len(device) > 26:
+                device = device[:25] + "…"
+            src = self._source_lang_code().upper()
+            engine = "Azure" if self._engine_code() == "azure" else "Local"
+            self.source_card_var.set(f"{device}\n{src} → {self._target_lang_code().upper()} · {engine}")
+            return
+        self.source_title_var.set("NDI SOURCE")
         name = self.source_var.get().strip() or "No source selected"
         info = self.input_info_var.get()
         if info and info != "Input: —":
@@ -448,7 +493,13 @@ class App:
             self.source_card_var.set(name)
 
     def _update_text_card(self):
-        if self.live_cfg.key_mode == "color":
+        if self.input_mode == "audio":
+            cap = self.caption_cfg
+            lines = int(cap.max_lines)
+            self.text_card_var.set(
+                f"Captions · {cap.font_size:.0f} px\n{lines} line{'s' if lines != 1 else ''}"
+            )
+        elif self.live_cfg.key_mode == "color":
             b, g, r = self.live_cfg.key_color_bgr
             self.text_card_var.set(f"Color key\nRGB({r}, {g}, {b})")
         else:
@@ -497,12 +548,29 @@ class App:
         self.output_panel.lift()
 
     def _build_source_panel(self):
-        win = self._make_panel_window("NDI Source")
+        win = self._make_panel_window("Input")
         self.source_panel = win
 
-        body = ttk.Frame(win)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        outer = ttk.Frame(win)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+        outer.columnconfigure(0, weight=1)
+
+        mode_row = ttk.Frame(outer)
+        mode_row.grid(row=0, column=0, sticky="we", pady=(0, 8))
+        ttk.Label(mode_row, text="Input type:").pack(side="left")
+        self.input_mode_var = tk.StringVar(value=INPUT_MODE_LABELS[self.input_mode])
+        self.input_mode_combo = ttk.Combobox(
+            mode_row, textvariable=self.input_mode_var, state="readonly",
+            values=list(INPUT_MODE_LABELS.values()), width=24,
+        )
+        self.input_mode_combo.pack(side="left", padx=6)
+        self.input_mode_combo.bind("<<ComboboxSelected>>", self._on_input_mode_change)
+        self._lock_while_running.append((self.input_mode_combo, "readonly"))
+
+        body = ttk.Frame(outer)
+        body.grid(row=1, column=0, sticky="we")
         body.columnconfigure(1, weight=1)
+        self.ndi_input_frame = body
 
         ttk.Label(body, text="NDI source:").grid(row=0, column=0, sticky="w")
         self.source_var = tk.StringVar()
@@ -515,6 +583,221 @@ class App:
             row=1, column=1, sticky="w", padx=4, pady=(4, 0)
         )
 
+        self._build_audio_input_frame(outer)
+        self._show_input_mode_frames()
+
+    def _build_audio_input_frame(self, outer):
+        """Audio (speech-to-text) mode settings: capture device/channel,
+        spoken and subtitle languages, recognition engine and its options."""
+        prefs = self.audio_prefs
+        frame = ttk.Frame(outer)
+        frame.grid(row=1, column=0, sticky="we")
+        frame.columnconfigure(1, weight=1)
+        self.audio_input_frame = frame
+
+        def combo(parent, var, values, width, on_change=None):
+            c = ttk.Combobox(parent, textvariable=var, state="readonly", values=values, width=width)
+            c.bind("<<ComboboxSelected>>", on_change or (lambda e: self._update_source_card()))
+            self._lock_while_running.append((c, "readonly"))
+            return c
+
+        def entry(parent, var, **kw):
+            e = ttk.Entry(parent, textvariable=var, **kw)
+            self._lock_while_running.append((e, "normal"))
+            return e
+
+        ttk.Label(frame, text="Audio device:").grid(row=0, column=0, sticky="w", pady=2)
+        self.audio_device_var = tk.StringVar(value=prefs.get("device_label", ""))
+        self.audio_device_combo = combo(frame, self.audio_device_var, [], 42, self._on_audio_device_change)
+        self.audio_device_combo.grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        refresh_btn = self._make_simple_button(frame, "Refresh", lambda: self._refresh_audio_devices(rescan=True))
+        refresh_btn.grid(row=0, column=2, padx=4)
+
+        ch_row = ttk.Frame(frame)
+        ch_row.grid(row=1, column=1, sticky="we", padx=4, pady=2)
+        ttk.Label(frame, text="Channel:").grid(row=1, column=0, sticky="w", pady=2)
+        self.audio_channel_var = tk.StringVar(value=prefs.get("channel", CHANNEL_MIX_LABEL))
+        self.audio_channel_combo = combo(ch_row, self.audio_channel_var, [CHANNEL_MIX_LABEL], 10)
+        self.audio_channel_combo.pack(side="left")
+        ttk.Label(ch_row, text="   Level:").pack(side="left")
+        self.level_canvas = tk.Canvas(
+            ch_row, width=LEVEL_METER_W, height=LEVEL_METER_H, bg=FIELD_BG,
+            highlightthickness=1, highlightbackground=BORDER,
+        )
+        self.level_canvas.pack(side="left", padx=6)
+        self.level_bar = self.level_canvas.create_rectangle(0, 0, 0, LEVEL_METER_H + 2, fill=PLAY_BG, width=0)
+
+        lang_row = ttk.Frame(frame)
+        lang_row.grid(row=2, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        ttk.Label(frame, text="Spoken language:").grid(row=2, column=0, sticky="w", pady=2)
+        self.source_lang_var = tk.StringVar(
+            value=SOURCE_LANG_LABELS.get(prefs.get("source_lang"), SOURCE_LANG_LABELS["auto"])
+        )
+        combo(lang_row, self.source_lang_var, list(SOURCE_LANG_LABELS.values()), 18).pack(side="left")
+        ttk.Label(lang_row, text="   Subtitles in:").pack(side="left")
+        self.target_lang_var = tk.StringVar(
+            value=TARGET_LANG_LABELS.get(prefs.get("target_lang"), TARGET_LANG_LABELS["pt"])
+        )
+        combo(lang_row, self.target_lang_var, list(TARGET_LANG_LABELS.values()), 11).pack(side="left", padx=6)
+
+        ttk.Label(frame, text="Engine:").grid(row=3, column=0, sticky="w", pady=2)
+        self.engine_var = tk.StringVar(value=ENGINE_LABELS.get(prefs.get("engine"), ENGINE_LABELS["local"]))
+        combo(frame, self.engine_var, list(ENGINE_LABELS.values()), 24, self._on_engine_change).grid(
+            row=3, column=1, sticky="w", padx=4, pady=2
+        )
+
+        self.local_engine_frame = ttk.Frame(frame)
+        self.local_engine_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=2)
+        ttk.Label(self.local_engine_frame, text="Whisper model:").pack(side="left")
+        self.whisper_model_var = tk.StringVar(value=prefs.get("whisper_model", "auto"))
+        combo(self.local_engine_frame, self.whisper_model_var, list(WHISPER_MODELS), 14).pack(side="left", padx=6)
+        ttk.Label(
+            self.local_engine_frame, text="auto = large-v3-turbo on NVIDIA GPU, small on CPU",
+            foreground=MUTED_FG,
+        ).pack(side="left", padx=6)
+
+        self.azure_engine_frame = ttk.Frame(frame)
+        self.azure_engine_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=2)
+        ttk.Label(self.azure_engine_frame, text="Azure key:").pack(side="left")
+        self.azure_key_var = tk.StringVar(value=prefs.get("azure_key", ""))
+        entry(self.azure_engine_frame, self.azure_key_var, show="•", width=28).pack(side="left", padx=6)
+        ttk.Label(self.azure_engine_frame, text="Region:").pack(side="left")
+        self.azure_region_var = tk.StringVar(value=prefs.get("azure_region", "westeurope"))
+        entry(self.azure_engine_frame, self.azure_region_var, width=14).pack(side="left", padx=6)
+
+        ttk.Label(frame, text="Names / terms:").grid(row=5, column=0, sticky="w", pady=2)
+        self.hotwords_var = tk.StringVar(value=prefs.get("hotwords", ""))
+        entry(frame, self.hotwords_var).grid(row=5, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        ttk.Label(
+            frame, text="Comma-separated, e.g. Gulbenkian, Coro Gulbenkian — helps recognize names.",
+            foreground=MUTED_FG,
+        ).grid(row=6, column=1, columnspan=2, sticky="w", padx=4)
+
+        if speech is None:
+            ttk.Label(
+                frame, text=f"Audio mode unavailable: {AUDIO_IMPORT_ERROR}", foreground=REC_BG,
+            ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        else:
+            self._refresh_audio_devices()
+        self._show_engine_frames()
+
+    # ---------- Input mode (NDI video / audio) ----------
+
+    def _source_lang_code(self):
+        return next((k for k, v in SOURCE_LANG_LABELS.items() if v == self.source_lang_var.get()), "auto")
+
+    def _target_lang_code(self):
+        return next((k for k, v in TARGET_LANG_LABELS.items() if v == self.target_lang_var.get()), "pt")
+
+    def _engine_code(self):
+        return next((k for k, v in ENGINE_LABELS.items() if v == self.engine_var.get()), "local")
+
+    def _on_input_mode_change(self, event=None):
+        mode = next((k for k, v in INPUT_MODE_LABELS.items() if v == self.input_mode_var.get()), "ndi")
+        if mode == "audio" and speech is None:
+            messagebox.showerror(APP_NAME, f"The audio mode is unavailable:\n\n{AUDIO_IMPORT_ERROR}")
+            self.input_mode_var.set(INPUT_MODE_LABELS["ndi"])
+            return
+        self.input_mode = mode
+        self._show_input_mode_frames()
+
+    def _show_input_mode_frames(self):
+        """Shows the input settings and TEXT panel sections that apply to
+        the current input mode (keying only applies to NDI video; caption
+        layout only to audio)."""
+        audio = self.input_mode == "audio"
+        if audio:
+            self.ndi_input_frame.grid_remove()
+            self.audio_input_frame.grid()
+        else:
+            self.audio_input_frame.grid_remove()
+            self.ndi_input_frame.grid()
+        if hasattr(self, "key_settings_frame"):
+            if audio:
+                if self.picking_color:
+                    self._end_color_pick()
+                self.key_settings_frame.grid_remove()
+                self.captions_frame.grid()
+            else:
+                self.captions_frame.grid_remove()
+                self.key_settings_frame.grid()
+        if hasattr(self, "source_card_var"):
+            self._update_source_card()
+            self._update_text_card()
+
+    def _on_engine_change(self, event=None):
+        self._show_engine_frames()
+        self._update_source_card()
+
+    def _show_engine_frames(self):
+        if self._engine_code() == "azure":
+            self.local_engine_frame.grid_remove()
+            self.azure_engine_frame.grid()
+        else:
+            self.azure_engine_frame.grid_remove()
+            self.local_engine_frame.grid()
+
+    def _refresh_audio_devices(self, rescan=False):
+        if speech is None:
+            return
+        if rescan and self.worker and self.worker.is_alive():
+            self._append_log("Stop the pipeline before rescanning audio devices.")
+            return
+        try:
+            self.audio_devices = audio_io.list_input_devices(rescan=rescan)
+        except Exception as e:
+            self._append_log(f"Could not list audio devices: {e}")
+            self.audio_devices = []
+        labels = [label for _idx, label, _ch in self.audio_devices]
+        self.audio_device_combo["values"] = labels
+        current = self.audio_device_var.get()
+        if current not in labels:
+            default_idx = audio_io.default_input_device()
+            default = next((lbl for idx, lbl, _ch in self.audio_devices if idx == default_idx), None)
+            self.audio_device_var.set(default or (labels[0] if labels else ""))
+        if rescan:
+            self._append_log(f"{len(labels)} audio input device(s) found.")
+        self._on_audio_device_change()
+
+    def _selected_audio_device(self):
+        label = self.audio_device_var.get()
+        return next(((idx, ch) for idx, lbl, ch in self.audio_devices if lbl == label), (None, 0))
+
+    def _on_audio_device_change(self, event=None):
+        _idx, max_ch = self._selected_audio_device()
+        values = [CHANNEL_MIX_LABEL] + [str(i) for i in range(1, max_ch + 1)]
+        self.audio_channel_combo["values"] = values
+        if self.audio_channel_var.get() not in values:
+            self.audio_channel_var.set(CHANNEL_MIX_LABEL)
+        self._update_source_card()
+
+    def _speech_settings(self):
+        device_index, _max_ch = self._selected_audio_device()
+        if device_index is None:
+            return None
+        channel = self.audio_channel_var.get()
+        return speech.SpeechSettings(
+            engine=self._engine_code(),
+            device_index=device_index,
+            channel=None if channel == CHANNEL_MIX_LABEL else int(channel) - 1,
+            source_lang=self._source_lang_code(),
+            target_lang=self._target_lang_code(),
+            whisper_model=self.whisper_model_var.get(),
+            hotwords=self.hotwords_var.get(),
+            azure_key=self.azure_key_var.get(),
+            azure_region=self.azure_region_var.get(),
+        )
+
+    def _update_level_meter(self, level_db):
+        frac = min(1.0, max(0.0, (level_db + 60.0) / 60.0))
+        color = REC_BG if level_db > -6.0 else PLAY_BG
+        self.level_canvas.coords(self.level_bar, 0, 0, frac * LEVEL_METER_W, LEVEL_METER_H + 2)
+        self.level_canvas.itemconfig(self.level_bar, fill=color)
+
+    def _set_input_settings_locked(self, locked):
+        for widget, state in self._lock_while_running:
+            widget.config(state="disabled" if locked else state)
+
     def _build_text_panel(self):
         win = self._make_panel_window("Text — keying, shadow & color")
         self.text_panel = win
@@ -523,7 +806,15 @@ class App:
         sliders.pack(fill="both", expand=True, padx=10, pady=10)
         sliders.columnconfigure(1, weight=1)
 
-        mode_row = ttk.Frame(sliders)
+        # Keying (NDI video mode) and caption layout (audio mode) share row 0;
+        # _show_input_mode_frames() shows the one for the current mode.
+        key_settings = ttk.Frame(sliders)
+        key_settings.grid(row=0, column=0, columnspan=3, sticky="we")
+        key_settings.columnconfigure(1, weight=1)
+        self.key_settings_frame = key_settings
+        self._build_captions_frame(sliders)
+
+        mode_row = ttk.Frame(key_settings)
         mode_row.grid(row=0, column=0, columnspan=3, sticky="we", padx=4, pady=(0, 6))
         ttk.Label(mode_row, text="Key mode:").pack(side="left")
         self.key_mode_var = tk.StringVar(value=KEY_MODE_LABELS[self.live_cfg.key_mode])
@@ -534,7 +825,7 @@ class App:
         key_mode_combo.pack(side="left", padx=6)
         key_mode_combo.bind("<<ComboboxSelected>>", self._on_key_mode_change)
 
-        self.luma_frame = ttk.Frame(sliders)
+        self.luma_frame = ttk.Frame(key_settings)
         self.luma_frame.grid(row=1, column=0, columnspan=3, sticky="we")
         self.luma_frame.columnconfigure(1, weight=1)
         self._add_slider(
@@ -546,7 +837,7 @@ class App:
             on_change=lambda _v: self._update_text_card(),
         )
 
-        self.color_key_frame = ttk.Frame(sliders)
+        self.color_key_frame = ttk.Frame(key_settings)
         self.color_key_frame.grid(row=1, column=0, columnspan=3, sticky="we")
         self.color_key_frame.columnconfigure(1, weight=1)
         ck_color_row = ttk.Frame(self.color_key_frame)
@@ -586,6 +877,30 @@ class App:
         self.color_swatch = self._add_color_picker(
             colors_row, "", "shadow_color_bgr", title="Shadow color"
         )
+        self._show_input_mode_frames()
+
+    def _build_captions_frame(self, parent):
+        """Caption layout for the audio mode: font, number of roll-up lines,
+        line width, position and how long captions stay up after speech."""
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, columnspan=3, sticky="we", pady=(0, 6))
+        frame.columnconfigure(1, weight=1)
+        self.captions_frame = frame
+        cap = self.caption_cfg
+        refresh = lambda _v: self._update_text_card()  # noqa: E731
+
+        self._add_slider(frame, 0, "Font size (px)", 16, 160, cap.font_size, "font_size",
+                         target=cap, on_change=refresh)
+        self._add_slider(frame, 1, "Lines", 1, 4, cap.max_lines, "max_lines", target=cap, on_change=refresh)
+        self._add_slider(frame, 2, "Line width (% of output)", 20, 100, cap.line_width_pct,
+                         "line_width_pct", target=cap)
+        self._add_slider(frame, 3, "Bottom margin (px)", 0, 1000, cap.bottom_margin, "bottom_margin", target=cap)
+        self._add_slider(frame, 4, "Clear after silence (s)", 1, 15, cap.hold_s, "hold_s", decimals=1, target=cap)
+        self.caption_bold_var = tk.BooleanVar(value=cap.bold)
+        ttk.Checkbutton(
+            frame, text="Bold", variable=self.caption_bold_var,
+            command=lambda: setattr(self.caption_cfg, "bold", self.caption_bold_var.get()),
+        ).grid(row=5, column=0, sticky="w", padx=4, pady=(2, 0))
 
     def _build_background_panel(self):
         win = self._make_panel_window("Background box")
@@ -1252,6 +1567,37 @@ class App:
         self.presets["_output"] = {attr: getattr(cfg, attr) for attr in OUTPUT_ATTRS}
         self._save_presets_to_disk()
 
+    def _load_audio_defaults(self):
+        """Caption layout + audio input settings from the last session. The
+        Azure key is kept in the same local, per-user presets file."""
+        cfg = CaptionConfig()
+        data = self.presets.get("_audio")
+        prefs = data if isinstance(data, dict) else {}
+        for attr in CAPTION_ATTRS:
+            if attr in prefs:
+                setattr(cfg, attr, float(prefs[attr]))
+        cfg.bold = bool(prefs.get("caption_bold", cfg.bold))
+        return cfg, prefs
+
+    def _save_audio_defaults(self):
+        values = {
+            "input_mode": self.input_mode,
+            "device_label": self.audio_device_var.get(),
+            "channel": self.audio_channel_var.get(),
+            "source_lang": self._source_lang_code(),
+            "target_lang": self._target_lang_code(),
+            "engine": self._engine_code(),
+            "whisper_model": self.whisper_model_var.get(),
+            "hotwords": self.hotwords_var.get(),
+            "azure_key": self.azure_key_var.get(),
+            "azure_region": self.azure_region_var.get(),
+        }
+        data = {key: values[key] for key in AUDIO_PREF_KEYS}
+        data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
+        data["caption_bold"] = self.caption_cfg.bold
+        self.presets["_audio"] = data
+        self._save_presets_to_disk()
+
     def _save_preset(self, slot):
         cfg = self.live_cfg
         self.presets[slot] = {attr: getattr(cfg, attr) for attr in PRESET_ATTRS}
@@ -1259,6 +1605,8 @@ class App:
         self.presets[slot]["box_enabled"] = cfg.box_enabled
         self.presets[slot]["key_mode"] = cfg.key_mode
         self.presets[slot].update({attr: getattr(self.output_cfg, attr) for attr in OUTPUT_ATTRS})
+        self.presets[slot].update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
+        self.presets[slot]["caption_bold"] = self.caption_cfg.bold
         self._save_presets_to_disk()
         self._append_log(f"Preset {slot} saved.")
 
@@ -1267,9 +1615,12 @@ class App:
         if not preset:
             self._append_log(f"Preset {slot} is empty.")
             return
-        for attr in PRESET_ATTRS:
+        for attr in PRESET_ATTRS + CAPTION_ATTRS:
             if attr in preset and attr in self.sliders:
                 self.sliders[attr].set(preset[attr])
+        if "caption_bold" in preset:
+            self.caption_cfg.bold = bool(preset["caption_bold"])
+            self.caption_bold_var.set(self.caption_cfg.bold)
         color_swatches = {
             "text_color_bgr": self.text_color_swatch,
             "shadow_color_bgr": self.color_swatch,
@@ -1364,19 +1715,27 @@ class App:
     def _start(self):
         if self.worker and self.worker.is_alive():
             return
-        idx = self.source_combo.current()
-        if idx < 0 or idx >= len(self.sources):
-            self._append_log("Select an NDI source before starting.")
-            return
-        source = self.sources[idx]
         output_name = self.output_name_var.get().strip() or APP_NAME
+        if self.input_mode == "audio":
+            settings = self._speech_settings()
+            if settings is None:
+                self._append_log("Select an audio input device before starting.")
+                return
+            target, args = self._run_audio_pipeline, (settings, output_name)
+        else:
+            idx = self.source_combo.current()
+            if idx < 0 or idx >= len(self.sources):
+                self._append_log("Select an NDI source before starting.")
+                return
+            target, args = self._run_pipeline, (self.sources[idx], output_name)
 
         self.stop_event.clear()
         self.source_combo.config(state="disabled")
+        self._set_input_settings_locked(True)
         self.status_var.set("Starting...")
         self._set_running_visual(True)
 
-        self.worker = threading.Thread(target=self._run_pipeline, args=(source, output_name), daemon=True)
+        self.worker = threading.Thread(target=target, args=args, daemon=True)
         self.worker.start()
 
     def _stop(self):
@@ -1443,6 +1802,86 @@ class App:
             self.msg_queue.put(("log", "Stopped."))
             self.msg_queue.put(("stopped", None))
 
+    def _run_audio_pipeline(self, settings, output_name):
+        """Audio mode: the speech engine (own thread) feeds a CaptionBoard;
+        this loop renders the visible caption lines, runs them through the
+        same keyer/shadow/box and output placement as the NDI mode, and
+        sends a frame per output frame period. Captions are only re-rendered
+        when the text or a setting changes."""
+        post = self.msg_queue.put
+        try:
+            sender = ndi_io.Sender(output_name)
+        except Exception as e:
+            post(("log", f"Failed to start: {e}"))
+            post(("stopped", None))
+            return
+
+        engine_status = ["Starting speech engine..."]
+
+        def on_status(text):
+            engine_status[0] = text
+            post(("status", text))
+
+        board = CaptionBoard()
+        engine = speech.create_engine(settings, board.update, log=lambda m: post(("log", m)), on_status=on_status)
+        engine.start()
+        post(("log", f"Captioning audio -> sending '{output_name}'."))
+
+        last_key = None
+        keyed = None
+        frames = 0
+        last_report = time.time()
+        last_preview = 0.0
+        last_level = 0.0
+        next_t = time.perf_counter()
+        try:
+            while not self.stop_event.is_set():
+                out_cfg = self.output_cfg
+                cap = self.caption_cfg
+                w, h = int(out_cfg.canvas_w), int(out_cfg.canvas_h)
+                font = load_font(cap.font_size, cap.bold)
+                lines = board.visible_lines(font, w * cap.line_width_pct / 100.0, cap.max_lines, cap.hold_s)
+                key = (lines, w, h, astuple(cap), astuple(self.live_cfg))
+                if key != last_key:
+                    keyed = render_keyed_captions(lines, w, h, cap, font, self.live_cfg)
+                    last_key = key
+                canvas = place_on_canvas(keyed, w, h, out_cfg.scale, out_cfg.pos_x_px, out_cfg.pos_y_px)
+
+                muted_now = self.muted
+                out_send = np.zeros_like(canvas) if muted_now else canvas
+                sender.send(out_send, frame_rate_n=out_cfg.fps_n, frame_rate_d=out_cfg.fps_d)
+                frames += 1
+
+                # NDI's clock_video already paces send(); this only kicks in
+                # if it isn't available, so the loop never free-runs.
+                next_t += out_cfg.fps_d / max(1, out_cfg.fps_n)
+                delay = next_t - time.perf_counter()
+                if delay > 0:
+                    self.stop_event.wait(delay)
+                elif delay < -0.5:
+                    next_t = time.perf_counter()
+
+                now = time.time()
+                if now - last_preview >= PREVIEW_INTERVAL_S:
+                    post(("preview", (canvas.copy(), muted_now, None)))
+                    last_preview = now
+                if now - last_level >= LEVEL_INTERVAL_S:
+                    post(("audio_level", engine.level_db))
+                    last_level = now
+                if now - last_report >= 2.0:
+                    fps = frames / (now - last_report)
+                    post(("status", f"{engine_status[0]} — {fps:.1f} fps"))
+                    frames = 0
+                    last_report = now
+        except Exception as e:
+            post(("log", f"Error during processing: {e}"))
+        finally:
+            engine.stop()
+            sender.close()
+            post(("audio_level", -120.0))
+            post(("log", "Stopped."))
+            post(("stopped", None))
+
     # ---------- Message queue (worker thread -> UI) ----------
 
     def _poll_queue(self):
@@ -1468,9 +1907,12 @@ class App:
                         fps_s = self._fmt_fps(*fr) if fr and fr[1] else "—"
                         self.input_info_var.set(f"Input: {xres}x{yres} @ {fps_s} fps")
                         self._update_source_card()
+                elif kind == "audio_level":
+                    self._update_level_meter(payload)
                 elif kind == "stopped":
                     self._set_running_visual(False)
                     self.source_combo.config(state="readonly")
+                    self._set_input_settings_locked(False)
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
                     self._update_source_card()
@@ -1654,9 +2096,10 @@ class App:
 
     def _on_close(self):
         self._save_output_defaults()
+        self._save_audio_defaults()
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
-            self.worker.join(timeout=2.0)
+            self.worker.join(timeout=4.0)
         self._sources_stop_event.set()
         if self._sources_thread.is_alive():
             self._sources_thread.join(timeout=2.0)
@@ -1666,6 +2109,14 @@ class App:
 
 
 def main():
+    # A --windowed PyInstaller build has no console: sys.stdout/stderr are
+    # None, and libraries that print progress (e.g. the Whisper model
+    # download) would crash writing to them.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     root = tk.Tk()
     try:
         App(root)

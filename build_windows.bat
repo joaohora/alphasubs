@@ -39,7 +39,20 @@ pyinstaller --noconfirm --onefile --windowed --name AlphaSubs ^
     --add-data "VERSION;." ^
     --collect-all NDIlib ^
     --collect-all cv2 ^
+    --collect-all faster_whisper ^
+    --collect-all ctranslate2 ^
+    --collect-all onnxruntime ^
+    --collect-all _sounddevice_data ^
+    --collect-all sacremoses ^
+    --collect-all subword_nmt ^
+    --collect-all azure.cognitiveservices.speech ^
     src\gui.py
+REM The CUDA/cuDNN DLLs (for Whisper on an NVIDIA GPU) are NOT bundled: at
+REM ~1 GB they would make the single-file exe very slow to start. To use the
+REM GPU with the exe, copy the DLLs from .venv\Lib\site-packages\nvidia\cublas\bin
+REM and .venv\Lib\site-packages\nvidia\cudnn\bin into a "cuda" folder next to
+REM AlphaSubs.exe (or install the CUDA 12 toolkit + cuDNN 9). Without them,
+REM Whisper runs on the CPU.
 if errorlevel 1 goto :error
 
 echo.

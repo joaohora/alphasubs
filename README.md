@@ -94,6 +94,48 @@ If the received signal's background isn't pure black (e.g. it went through
 compression and "black" sits around luminance 16-20), raise `--black-level`
 until the background fully disappears without eating into the text's edges.
 
+## Audio mode (speech-to-text captions)
+
+Instead of keying an NDI caption signal, AlphaSubs can listen to an audio
+input and generate the captions itself. In the GUI, open the first module
+card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
+
+- **Audio device / Channel:** any input device on the computer (mic, sound
+  card, Dante Virtual Soundcard, NDI Audio, ...). *Mix (1+2)* averages the
+  first two channels; pick a single channel for multichannel interfaces.
+  The level meter shows what is being received.
+- **Spoken language:** English, Português, Español, or *Auto* (detected per
+  sentence among the three).
+- **Subtitles in:** Português or English. Speech in another language is
+  translated.
+- **Engine:**
+  - *Local (Whisper, offline)*: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+    for recognition plus offline [Argos Translate](https://github.com/argosopentech/argos-translate)
+    models for translation. `auto` uses `large-v3-turbo` on an NVIDIA GPU
+    and `small` on the CPU. The models download once, on first Start
+    (Whisper ~1.6 GB for turbo, ~100 MB per translation pair), into
+    `~/.alphasubs_models`. After that it works without internet.
+  - *Cloud (Azure Speech)*: Azure AI Speech translation (streaming, lower
+    latency, Portuguese from Portugal). It needs a Speech resource key and
+    region, and an internet connection. The key is stored in the local
+    presets file (`~/.alphasubs_presets.json`).
+- **Names / terms:** comma-separated words to bias recognition (names of
+  performers, works, institutions).
+
+The TEXT panel then shows the caption layout (font size, number of roll-up
+lines, line width, bottom margin, clear-after-silence time) instead of the
+keying controls. Shadow, text color, the background box and the OUTPUT
+settings work exactly as in the NDI mode, and so do presets.
+
+Expected latency is about 1–3 s from speech to caption with the local engine
+(the text appears while the person is still speaking and is refined when
+they pause).
+
+**GPU on Windows:** `requirements.txt` installs the CUDA 12/cuDNN 9 runtime
+(`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`), which the app picks up
+automatically. If the GPU can't be used, it logs why and falls back to the
+CPU. For `AlphaSubs.exe`, see the note in `build_windows.bat`.
+
 ## Testing without a real source
 
 `tools/test_source.py` emits a synthetic `TEST-CAPTION-SRC` source (black
@@ -112,6 +154,10 @@ python3 src/main.py --source TEST-CAPTION-SRC --output-name "AlphaSubs"
 ```
 src/ndi_io.py       # thin wrapper over NDIlib: discovery, receiver, sender
 src/compositor.py   # luminance keying + shadow (pure numpy/OpenCV, testable in isolation)
+src/audio_io.py     # audio input devices + capture (16 kHz mono)
+src/speech.py       # speech engines: local Whisper and Azure Speech
+src/translator.py   # offline EN/ES/PT translation (Argos models via CTranslate2)
+src/captions.py     # caption layout (roll-up lines) and rendering through the keyer
 src/main.py         # CLI and main loop
 src/gui.py          # Tkinter GUI for operating without a terminal
 build_windows.bat   # builds dist\AlphaSubs.exe via PyInstaller (run on Windows)
