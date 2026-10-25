@@ -68,11 +68,14 @@ CHANNEL_MIX_LABEL = "Mix (1+2)"
 NDI_INPUT_PREFIX = "NDI: "
 LEVEL_METER_W, LEVEL_METER_H = 140, 10
 LEVEL_INTERVAL_S = 0.1
-# Audio-mode settings remembered between sessions (in the presets file).
-AUDIO_PREF_KEYS = (
-    "input_mode", "device_label", "channel", "source_lang", "target_lang",
-    "engine", "whisper_model", "hotwords", "azure_key", "azure_region",
-    "voice_engine", "voice_name", "voice_device_label", "voice_ndi", "voice_lang",
+# The app's configuration beyond the look — input, recognition, voice and the
+# output name. Saved in each preset (under "_app") and, together with the
+# Azure key/region (app-wide, never in presets), as the last session.
+APP_SETTING_KEYS = (
+    "input_mode", "ndi_source_name", "output_name",
+    "device_label", "channel", "source_lang", "target_lang", "engine", "whisper_model", "hotwords",
+    "voice_engine", "voice_name", "voice_lang", "voice_device_label", "voice_ndi",
+    "voice_speed", "voice_volume", "voice_buffer_ms",
 )
 VOICE_ENGINE_LABELS = {"off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)"}
 VOICE_LANG_LABELS = {"same": "Same as subtitles", "pt": "Português", "en": "English"}
@@ -192,6 +195,11 @@ class App:
         self._lock_while_running = []  # (widget, state to restore) for input settings
         self._monitor = None  # meter-only audio capture while stopped
         self._monitor_gen = 0
+        # NDI (key mode) source from a preset / the last session, selected
+        # once discovery finds it.
+        self._wanted_ndi_source = self.audio_prefs.get("ndi_source_name") or None
+        # A preset's setup applied while running, waiting for Stop.
+        self._pending_app_settings = None
 
         ndi_io.initialize()
         self._source_finder = ndi_io.Finder()
@@ -615,10 +623,10 @@ class App:
         self.ndi_input_frame = body
 
         ttk.Label(body, text="NDI source:").grid(row=0, column=0, sticky="w")
-        self.source_var = tk.StringVar()
+        self.source_var = tk.StringVar(value=self._wanted_ndi_source or "")
         self.source_combo = ttk.Combobox(body, textvariable=self.source_var, state="readonly", width=42)
         self.source_combo.grid(row=0, column=1, sticky="we", padx=4)
-        self.source_combo.bind("<<ComboboxSelected>>", lambda e: self._update_source_card())
+        self.source_combo.bind("<<ComboboxSelected>>", self._on_ndi_source_selected)
         self._make_simple_button(body, "Refresh", self._refresh_sources).grid(row=0, column=2, padx=4)
 
         ttk.Label(body, textvariable=self.input_info_var, foreground=MUTED_FG).grid(
@@ -627,6 +635,10 @@ class App:
 
         self._build_audio_input_frame(outer)
         self._show_input_mode_frames()
+
+    def _on_ndi_source_selected(self, event=None):
+        self._wanted_ndi_source = None  # the operator's pick wins over a saved one
+        self._update_source_card()
 
     def _build_audio_input_frame(self, outer):
         """Audio (speech-to-text) mode settings: capture device/channel,
@@ -1449,7 +1461,7 @@ class App:
         name_row = ttk.Frame(frame)
         name_row.pack(fill="x", pady=(0, 8))
         ttk.Label(name_row, text="Output name:").pack(side="left")
-        self.output_name_var = tk.StringVar(value=APP_NAME)
+        self.output_name_var = tk.StringVar(value=self.audio_prefs.get("output_name") or APP_NAME)
         self.output_name_var.trace_add("write", lambda *a: self._update_output_card())
         ttk.Entry(name_row, textvariable=self.output_name_var).pack(
             side="left", fill="x", expand=True, padx=6
@@ -1876,8 +1888,23 @@ class App:
         return cfg, prefs
 
     def _save_audio_defaults(self):
+        """The last session: the whole app configuration + the Azure key and
+        region (app-wide) + the caption layout."""
+        data = self._collect_app_settings()
+        data["azure_key"] = self.azure_key_var.get()
+        data["azure_region"] = self.azure_region_var.get()
+        data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
+        data["caption_bold"] = self.caption_cfg.bold
+        data["caption_live"] = self.caption_cfg.live
+        self.presets["_audio"] = data
+        self._save_presets_to_disk()
+
+    def _collect_app_settings(self):
+        """Everything but the look (see APP_SETTING_KEYS)."""
         values = {
             "input_mode": self.input_mode,
+            "ndi_source_name": self._current_ndi_source_name(),
+            "output_name": self.output_name_var.get().strip() or APP_NAME,
             "device_label": self.audio_device_var.get(),
             "channel": self.audio_channel_var.get(),
             "source_lang": self._source_lang_code(),
@@ -1885,24 +1912,84 @@ class App:
             "engine": self._engine_code(),
             "whisper_model": self.whisper_model_var.get(),
             "hotwords": self.hotwords_var.get(),
-            "azure_key": self.azure_key_var.get(),
-            "azure_region": self.azure_region_var.get(),
             "voice_engine": self._voice_engine_code(),
             "voice_name": self.voice_name_var.get(),
+            "voice_lang": next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same"),
             "voice_device_label": self.voice_device_var.get(),
             "voice_ndi": self.voice_ndi_var.get(),
-            "voice_lang": next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same"),
         }
-        data = {key: values[key] for key in AUDIO_PREF_KEYS}
-        data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
-        data["caption_bold"] = self.caption_cfg.bold
-        data["caption_live"] = self.caption_cfg.live
         if self.voice_tuning is not None:
-            data["voice_speed"] = self.voice_tuning.speed
-            data["voice_volume"] = self.voice_tuning.volume
-            data["voice_buffer_ms"] = self.voice_tuning.buffer_ms
-        self.presets["_audio"] = data
-        self._save_presets_to_disk()
+            values["voice_speed"] = self.voice_tuning.speed
+            values["voice_volume"] = self.voice_tuning.volume
+            values["voice_buffer_ms"] = self.voice_tuning.buffer_ms
+        return {key: values[key] for key in APP_SETTING_KEYS if key in values}
+
+    def _apply_app_settings(self, values):
+        """Applies a _collect_app_settings() dict to the UI (only while
+        stopped: these settings are read on Start). Missing keys are left as
+        they are; a device, NDI source or voice that isn't available here is
+        kept as the wanted choice (NDI sources may show up later)."""
+        if "output_name" in values:
+            self.output_name_var.set(values["output_name"] or APP_NAME)
+        if values.get("ndi_source_name"):
+            self._select_ndi_source(values["ndi_source_name"])
+        if speech is not None:
+            lang_vars = (
+                ("source_lang", self.source_lang_var, SOURCE_LANG_LABELS),
+                ("target_lang", self.target_lang_var, TARGET_LANG_LABELS),
+                ("engine", self.engine_var, ENGINE_LABELS),
+                ("voice_engine", self.voice_engine_var, VOICE_ENGINE_LABELS),
+                ("voice_lang", self.voice_lang_var, VOICE_LANG_LABELS),
+            )
+            for key, var, labels in lang_vars:
+                if values.get(key) in labels:
+                    var.set(labels[values[key]])
+            self._show_engine_frames()
+            for key, var in (("whisper_model", self.whisper_model_var), ("hotwords", self.hotwords_var)):
+                if key in values:
+                    var.set(values[key])
+            if "device_label" in values:
+                self.audio_device_var.set(values["device_label"])
+                self._on_audio_device_change()
+            if values.get("channel") in self.audio_channel_combo["values"]:
+                self.audio_channel_var.set(values["channel"])
+            self._refresh_voice_names()
+            if values.get("voice_name") in self.voice_name_combo["values"]:
+                self.voice_name_var.set(values["voice_name"])
+            if values.get("voice_device_label") in self.voice_device_combo["values"]:
+                self.voice_device_var.set(values["voice_device_label"])
+            if "voice_ndi" in values:
+                self.voice_ndi_var.set(bool(values["voice_ndi"]))
+            for key, attr in (("voice_speed", "speed"), ("voice_volume", "volume"), ("voice_buffer_ms", "buffer_ms")):
+                if key in values and attr in self.sliders:
+                    self.sliders[attr].set(float(values[key]))
+        mode = values.get("input_mode")
+        if mode in INPUT_MODE_LABELS and not (mode == "audio" and speech is None):
+            self.input_mode_var.set(INPUT_MODE_LABELS[mode])
+            self._on_input_mode_change()
+        else:
+            self._restart_monitor()
+        self._update_source_card()
+        self._update_voice_card()
+        self._update_output_card()
+
+    def _current_ndi_source_name(self):
+        idx = self.source_combo.current()
+        if 0 <= idx < len(self.sources):
+            return self.sources[idx].ndi_name
+        return self._wanted_ndi_source or ""
+
+    def _select_ndi_source(self, name):
+        """Selects the NDI (key mode) source `name` now if it's on the
+        network, or as soon as discovery finds it."""
+        names = [s.ndi_name for s in self.sources]
+        if name in names:
+            self.source_combo.current(names.index(name))
+            self._wanted_ndi_source = None
+        else:
+            self._wanted_ndi_source = name
+            self.source_var.set(name)
+        self._update_source_card()
 
     def _save_preset(self, slot):
         cfg = self.live_cfg
@@ -1914,8 +2001,9 @@ class App:
         self.presets[slot].update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         self.presets[slot]["caption_bold"] = self.caption_cfg.bold
         self.presets[slot]["caption_live"] = self.caption_cfg.live
+        self.presets[slot]["_app"] = self._collect_app_settings()
         self._save_presets_to_disk()
-        self._append_log(f"Preset {slot} saved.")
+        self._append_log(f"Preset {slot} saved (look + input, recognition, voice and output name).")
 
     def _apply_preset(self, slot):
         preset = self.presets.get(slot)
@@ -1953,7 +2041,20 @@ class App:
         self._update_text_card()
         self._update_background_card()
         self._update_output_card()
-        self._append_log(f"Preset {slot} applied.")
+        app = preset.get("_app")
+        if not isinstance(app, dict):
+            self._append_log(f"Preset {slot} applied (look only — saved before presets held the full setup).")
+        elif self.worker and self.worker.is_alive():
+            # Changing the input/voice mid-broadcast would cut the signal: the
+            # look is live now, the rest waits for the next Start.
+            self._pending_app_settings = app
+            self._append_log(
+                f"Preset {slot}: look applied. Input, recognition, voice and output name "
+                "will apply when you Stop (they take effect on the next Start)."
+            )
+        else:
+            self._apply_app_settings(app)
+            self._append_log(f"Preset {slot} applied.")
 
     def _apply_output_values(self, values):
         """Applies output values (resolution/fps/scale/position) found in
@@ -2044,7 +2145,10 @@ class App:
         else:
             idx = self.source_combo.current()
             if idx < 0 or idx >= len(self.sources):
-                self._append_log("Select an NDI source before starting.")
+                if self._wanted_ndi_source:
+                    self._append_log(f"NDI source '{self._wanted_ndi_source}' isn't on the network (yet).")
+                else:
+                    self._append_log("Select an NDI source before starting.")
                 return
             target, args = self._run_pipeline, (self.sources[idx], output_name)
 
@@ -2256,7 +2360,12 @@ class App:
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
                     self._update_source_card()
-                    self._restart_monitor()
+                    if self._pending_app_settings is not None:
+                        pending, self._pending_app_settings = self._pending_app_settings, None
+                        self._apply_app_settings(pending)
+                        self._append_log("Preset setup (input, recognition, voice, output name) applied.")
+                    else:
+                        self._restart_monitor()
                 elif kind == "update_checked":
                     status, detail = payload
                     self._on_update_checked(status, detail)
@@ -2280,9 +2389,13 @@ class App:
         names = [s.ndi_name for s in sources]
         self.source_combo["values"] = names
 
-        if selected_name in names:
+        if self._wanted_ndi_source in names:
+            # A source chosen by a preset / the last session, now on the network.
+            self.source_combo.current(names.index(self._wanted_ndi_source))
+            self._wanted_ndi_source = None
+        elif selected_name in names:
             self.source_combo.current(names.index(selected_name))
-        elif names and self.source_combo.current() < 0:
+        elif names and self.source_combo.current() < 0 and not self._wanted_ndi_source:
             self.source_combo.current(0)
 
         if {s.ndi_name for s in sources} != previous_names:

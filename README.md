@@ -46,6 +46,25 @@ On Windows, after building the executable (see the next section), just
 double-click `AlphaSubs.exe` — no Python installation needed on the
 operator's machine.
 
+#### Presets (1–8: tap = apply, hold = save)
+
+A preset holds the whole setup: the look (keying, text/shadow colors, box,
+caption layout, output resolution/fps/position) and the configuration
+(input type, NDI source or audio device/channel, spoken and caption
+languages, recognition engine and model, names/terms, voice settings and
+the NDI output name). The Azure key and region are app-wide and never
+stored in a preset.
+
+- Applied while **stopped**, everything changes at once.
+- Applied while **running**, the look changes immediately; the input,
+  recognition, voice and output name are applied when you press Stop (so
+  the broadcast isn't cut), and take effect on the next Start.
+- Presets saved by older versions hold only the look, and apply only that.
+
+The last session (including the NDI source and output name) is restored
+when the app opens. An NDI source that isn't on the network yet is
+selected as soon as it appears.
+
 #### Building AlphaSubs.exe (Windows)
 
 On a Windows machine with Python 3.10+ (installed from python.org, to make
