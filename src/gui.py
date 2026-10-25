@@ -1003,8 +1003,8 @@ class App:
                              "buffer_ms", target=self.voice_tuning)
 
         for row, text in enumerate((
-            "Speaks whole sentences, a few seconds behind the speaker; it speeds up and skips"
-            " sentences if it falls too far behind.",
+            "Speaks whole sentences, a few seconds behind the speaker; it speeds up (up to +35%)"
+            " as it falls behind, and skips sentences only past 20 s of delay.",
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
             "Azure voices use the key and region from the Input panel.",
@@ -2176,7 +2176,9 @@ class App:
                 cap = self.caption_cfg
                 w, h = int(out_cfg.canvas_w), int(out_cfg.canvas_h)
                 font = load_font(cap.font_size, cap.bold)
-                lines = board.visible_lines(font, w * cap.line_width_pct / 100.0, cap.max_lines, cap.hold_s)
+                lines = board.visible_lines(
+                    font, w * cap.line_width_pct / 100.0, cap.max_lines, cap.hold_s, pop_on=not cap.live
+                )
                 key = (lines, w, h, astuple(cap), astuple(self.live_cfg))
                 if key != last_key:
                     keyed = render_keyed_captions(lines, w, h, cap, font, self.live_cfg)

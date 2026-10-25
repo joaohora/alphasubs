@@ -32,6 +32,15 @@ SR = audio_io.SAMPLE_RATE
 LANGS = ("en", "pt", "es")
 AZURE_LOCALES = {"en": "en-US", "pt": "pt-PT", "es": "es-ES"}
 AZURE_TARGETS = {"pt": "pt-pt", "en": "en"}
+AZURE_SEGMENT_STRATEGY = "Semantic"
+# A final of at most this many words (a fragment at a hesitation: "No final."
+# + "haverá uma conversa...") is held while the person keeps talking, and
+# joined to the next final. It goes out alone once Azure has reported no
+# speech for AZURE_MERGE_IDLE_S, or after AZURE_MERGE_MAX_S at most. Longer
+# finals go out at once.
+AZURE_SHORT_WORDS = 5
+AZURE_MERGE_IDLE_S = 1.6
+AZURE_MERGE_MAX_S = 8.0
 WHISPER_DIR = Path.home() / ".alphasubs_models" / "whisper"
 # "auto" on an NVIDIA GPU: the best model that loads (smaller GPUs can't fit
 # large-v3-turbo), in the fastest compute type the GPU supports.
@@ -409,6 +418,13 @@ class AzureEngine(_Engine):
             config = speechsdk.translation.SpeechTranslationConfig(subscription=key, region=region)
             config.speech_recognition_language = AZURE_LOCALES[s.source_lang]
             auto_detect = None
+        # Segmentation: by default Azure ends a sentence after ~0.5 s of
+        # silence — mid-sentence at every hesitation, while fast continuous
+        # conversation (no such pauses) became one 30 s block. "Semantic" ends
+        # sentences by meaning instead (it can't be combined with a silence
+        # timeout); the short fragments it still leaves at long hesitations
+        # are joined below (see merge_short).
+        config.set_property(speechsdk.PropertyId.Speech_SegmentationStrategy, AZURE_SEGMENT_STRATEGY)
         targets = [s.target_lang] + [lang for lang in s.extra_target_langs if lang != s.target_lang]
         for lang in targets:
             config.add_target_language(AZURE_TARGETS[lang])
@@ -440,14 +456,61 @@ class AzureEngine(_Engine):
             translations = result.translations or {}
             return next((t for code, t in translations.items() if code.lower() == wanted), "")
 
+        held = {"info": None, "since": 0.0, "activity": 0.0}  # a short final waiting to be joined
+        held_lock = threading.Lock()
+
         def on_recognizing(evt):
+            held["activity"] = time.monotonic()  # the person is still talking
             self.on_caption(text_in(evt.result, s.target_lang), False)
 
+        def emit(info):
+            self.on_caption(info["texts"][s.target_lang], True, info)
+
+        def join(a, b):
+            return {
+                "lang": a["lang"],
+                "source": f"{a['source']} {b['source']}",
+                "texts": {lang: f"{a['texts'][lang]} {b['texts'][lang]}".strip() for lang in targets},
+            }
+
+        def merge_short(info):
+            with held_lock:
+                pending, held["info"] = held["info"], None
+            if pending is not None:
+                if pending["lang"] == info["lang"]:
+                    emit(join(pending, info))
+                    return
+                emit(pending)
+            if len(info["source"].split()) <= AZURE_SHORT_WORDS:
+                with held_lock:
+                    now = time.monotonic()
+                    held["info"], held["since"], held["activity"] = info, now, now
+            else:
+                emit(info)
+
+        def flush_held(force=False):
+            with held_lock:
+                if held["info"] is None:
+                    return
+                now = time.monotonic()
+                idle = now - held["activity"] >= AZURE_MERGE_IDLE_S
+                if not (force or idle or now - held["since"] >= AZURE_MERGE_MAX_S):
+                    return
+                pending, held["info"] = held["info"], None
+            emit(pending)
+
+        def letters(text):
+            return sum(ch.isalpha() for ch in text)
+
         def on_recognized(evt):
-            if evt.result.reason == speechsdk.ResultReason.TranslatedSpeech:
-                r = evt.result
-                info = {"lang": source_lang(r), "source": r.text, "texts": {lang: text_in(r, lang) for lang in targets}}
-                self.on_caption(info["texts"][s.target_lang], True, info)
+            if evt.result.reason != speechsdk.ResultReason.TranslatedSpeech:
+                return
+            r = evt.result
+            info = {"lang": source_lang(r), "source": r.text, "texts": {lang: text_in(r, lang) for lang in targets}}
+            # A final under two letters ("E.", "Hm.") — in the source or the
+            # captions — is noise or a cut-off word, not a caption.
+            if letters(info["source"]) >= 2 and letters(info["texts"][s.target_lang]) >= 2:
+                merge_short(info)
 
         def on_canceled(evt):
             if evt.reason == speechsdk.CancellationReason.Error:
@@ -468,6 +531,8 @@ class AzureEngine(_Engine):
                 block = self.capture.read(timeout=0.1)
                 if block is not None and len(block):
                     stream.write((np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+                flush_held()
         finally:
             stream.close()
             recognizer.stop_continuous_recognition()
+            flush_held(force=True)

@@ -1,7 +1,8 @@
 """Live caption layout and rendering for the audio (speech-to-text) mode.
 
 CaptionBoard holds what the speech engine has said so far (finalized text +
-the in-progress partial) and lays it out as roll-up subtitle lines.
+the in-progress partial) and lays it out as subtitle lines: roll-up in the
+live mode, pop-on pages of finished sentences otherwise.
 render_keyed_captions() draws those lines as white-on-black, exactly like the
 caption signal the NDI mode receives, and runs them through the regular keyer
 (process_frame), so shadow/color/box follow the same TEXT/BACKGROUND
@@ -10,6 +11,7 @@ settings."""
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -20,6 +22,14 @@ from compositor import KeyerConfig, box_rect, process_frame
 
 LINE_SPACING = 1.25
 MAX_COMMITTED = 6
+# Pop-on paging: a page stays up at least its reading time (subtitle
+# convention ~17 characters/s, never under PAGE_MIN_S); when more text is
+# already waiting, pages move CATCH_UP_FACTOR x faster (never under
+# PAGE_MIN_FAST_S).
+READING_CPS = 17.0
+PAGE_MIN_S = 1.5
+PAGE_MIN_FAST_S = 1.0
+CATCH_UP_FACTOR = 1.5
 
 if sys.platform == "win32":
     _FONT_DIR = Path("C:/Windows/Fonts")
@@ -90,13 +100,25 @@ def wrap_lines(text, font, max_width):
 
 class CaptionBoard:
     """Thread-safe store of the captions: the speech engine calls update()
-    from its thread, the output loop calls visible_lines() from another."""
+    from its thread, the output loop calls visible_lines() from another.
+
+    Two layouts:
+    - roll-up (live mode): all recent text, the last `max_lines` lines of it,
+      updating as the partial changes;
+    - pop-on (finished sentences only): each sentence on its own, never
+      mixed with the previous one; a sentence longer than `max_lines` is
+      split into pages shown one after another, each up for a reading time
+      (shorter when more text is waiting, so it doesn't fall behind)."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._committed = []
         self._partial = ""
         self._last_change = 0.0
+        # pop-on: finals not yet paged (bounded: unused while in live mode)
+        self._sentences = deque(maxlen=MAX_COMMITTED)
+        self._pages = deque()  # pop-on: pages (line tuples) waiting
+        self._page = None  # pop-on: (lines, shown_at, min_duration)
 
     def update(self, text, final):
         text = text.strip()
@@ -105,6 +127,7 @@ class CaptionBoard:
                 if text:
                     self._committed.append(text)
                     del self._committed[:-MAX_COMMITTED]
+                    self._sentences.append(text)
                 self._partial = ""
             else:
                 self._partial = text
@@ -114,8 +137,13 @@ class CaptionBoard:
         with self._lock:
             self._committed.clear()
             self._partial = ""
+            self._sentences.clear()
+            self._pages.clear()
+            self._page = None
 
-    def visible_lines(self, font, max_width, max_lines, hold_s):
+    def visible_lines(self, font, max_width, max_lines, hold_s, pop_on=False):
+        if pop_on:
+            return self._pop_on_lines(font, max_width, max(1, int(max_lines)), hold_s)
         with self._lock:
             if time.monotonic() - self._last_change > hold_s:
                 self._committed.clear()
@@ -124,6 +152,26 @@ class CaptionBoard:
         if not text:
             return ()
         return tuple(wrap_lines(text, font, max_width)[-max(1, int(max_lines)):])
+
+    def _pop_on_lines(self, font, max_width, max_lines, hold_s):
+        with self._lock:
+            now = time.monotonic()
+            page = self._page
+            if page is None or now - page[1] >= page[2]:
+                if not self._pages and self._sentences:
+                    lines = wrap_lines(self._sentences.popleft(), font, max_width)
+                    self._pages.extend(
+                        tuple(lines[i:i + max_lines]) for i in range(0, len(lines), max_lines)
+                    )
+                if self._pages:
+                    lines = self._pages.popleft()
+                    duration = max(PAGE_MIN_S, sum(len(line) for line in lines) / READING_CPS)
+                    if self._pages or self._sentences:
+                        duration = max(PAGE_MIN_FAST_S, duration / CATCH_UP_FACTOR)
+                    self._page = (lines, now, duration)
+                elif page is not None and now - page[1] >= page[2] + hold_s:
+                    self._page = None
+            return self._page[0] if self._page else ()
 
 
 def _render_gray(lines, canvas_w, canvas_h, cap_cfg, font):

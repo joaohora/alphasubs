@@ -123,18 +123,27 @@ card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
   - *Cloud (Azure Speech)*: Azure AI Speech translation (streaming, lower
     latency, Portuguese from Portugal). It needs a Speech resource key and
     region, and an internet connection. The key is stored in the local
-    presets file (`~/.alphasubs_presets.json`).
+    presets file (`~/.alphasubs_presets.json`). Sentences are split by
+    meaning (semantic segmentation), so fast continuous conversation is
+    captioned sentence by sentence too. Short fragments left at long
+    hesitations are joined to the next sentence. Captions typically arrive
+    0.5–1 s after the end of each sentence.
 - **Names / terms:** comma-separated words to bias recognition (names of
   performers, works, institutions).
 
-The TEXT panel then shows the caption layout (font size, number of roll-up
-lines, line width, bottom margin, clear-after-silence time) instead of the
-keying controls. Shadow, text color, the background box and the OUTPUT
-settings work exactly as in the NDI mode, and so do presets.
+The TEXT panel then shows the caption layout (font size, number of lines,
+line width, bottom margin, clear-after-silence time) instead of the keying
+controls. Shadow, text color, the background box and the OUTPUT settings
+work exactly as in the NDI mode, and so do presets.
 
-Expected latency is about 1–3 s from speech to caption with the local engine
-(the text appears while the person is still speaking and is refined when
-they pause).
+By default each finished sentence appears on its own, and never changes once
+it's up. A sentence longer than the number of lines is shown as consecutive
+pages, each up for a reading time (faster when more text is waiting). With
+**Show text while speaking**, text appears as the person talks instead
+(roll-up, faster, but it visibly corrects itself).
+
+Expected latency is about 2–3 s from the end of a sentence to its caption
+with the local engine on a CPU, less with a GPU or with Azure.
 
 ### Translated voice (VOICE module)
 
@@ -158,8 +167,10 @@ captions keep working. Open the **VOICE** card:
   raise it; it adds that much delay. Applies on Start.
 
 The voice speaks whole sentences, so it starts about 1.5–2.5 s after each
-sentence ends. When a backlog builds up during long speeches, it speeds up,
-and it skips sentences that would start more than 12 s late.
+sentence ends. When a backlog builds up during long speeches, it speeds up
+progressively (up to +35%), and it skips sentences only if they would start
+more than 20 s late. Fast, continuous conversation is still hard to follow
+with a synthetic voice: it works best with presentations and speeches.
 
 Keep the voice out of the microphone's reach (don't send it to the room's
 PA), or it will be picked up and translated again.

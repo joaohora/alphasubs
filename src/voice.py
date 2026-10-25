@@ -43,11 +43,14 @@ AZURE_VOICES = {
     "pt": ("pt-PT-RaquelNeural", "pt-PT-DuarteNeural", "pt-PT-FernandaNeural"),
     "en": ("en-GB-SoniaNeural", "en-GB-RyanNeural", "en-US-JennyNeural", "en-US-GuyNeural"),
 }
-# Above this much pending speech (s), sentences are spoken SPEEDUP x faster;
-# a sentence that would start more than MAX_LAG_S late is skipped.
-SPEEDUP_LAG_S = 4.0
-SPEEDUP = 1.15
-MAX_LAG_S = 12.0
+# Natural, continuous speech is faster than a synthetic voice, so the voice
+# speeds up progressively with the pending backlog: +SPEEDUP_PER_S per second
+# of backlog above SPEEDUP_START_S, up to SPEEDUP_MAX. Only a sentence that
+# would still start more than MAX_LAG_S late is skipped.
+SPEEDUP_START_S = 2.0
+SPEEDUP_PER_S = 0.06
+SPEEDUP_MAX = 1.35
+MAX_LAG_S = 20.0
 CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
 
 
@@ -322,7 +325,8 @@ class VoiceOutput:
             if waited + buffered > MAX_LAG_S:
                 self.log(f"Voice too far behind — skipped: {info.get('source', '')[:60]}")
                 continue
-            speed = self.tuning.speed * (SPEEDUP if self._pending_s() > SPEEDUP_LAG_S else 1.0)
+            backlog = max(0.0, self._pending_s() - SPEEDUP_START_S)
+            speed = self.tuning.speed * min(SPEEDUP_MAX, 1.0 + backlog * SPEEDUP_PER_S)
             try:
                 text = self._text_for(info)
                 if not text:
