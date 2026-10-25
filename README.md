@@ -101,9 +101,12 @@ input and generate the captions itself. In the GUI, open the first module
 card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
 
 - **Audio device / Channel:** any input device on the computer (mic, sound
-  card, Dante Virtual Soundcard, NDI Audio, ...). *Mix (1+2)* averages the
-  first two channels; pick a single channel for multichannel interfaces.
-  The level meter shows what is being received.
+  card, Dante Virtual Soundcard, ...), or the audio of any **NDI source**
+  on the network (listed as `NDI: …`). NDI audio is received directly
+  (audio only), with no virtual audio device needed. *Mix (1+2)* averages
+  the first two channels; pick a single channel for multichannel inputs.
+  The level meter (on the card and in the panel, in dB) shows the signal
+  even before Start.
 - **Spoken language:** English, Português, Español, or *Auto* (detected per
   sentence among the three).
 - **Subtitles in:** Português or English. Speech in another language is

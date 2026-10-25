@@ -65,6 +65,7 @@ TARGET_LANG_LABELS = {"pt": "Português", "en": "English"}
 ENGINE_LABELS = {"local": "Local (Whisper, offline)", "azure": "Cloud (Azure Speech)"}
 WHISPER_MODELS = ("auto", "large-v3-turbo", "large-v3", "medium", "small", "base")
 CHANNEL_MIX_LABEL = "Mix (1+2)"
+NDI_INPUT_PREFIX = "NDI: "
 LEVEL_METER_W, LEVEL_METER_H = 140, 10
 LEVEL_INTERVAL_S = 0.1
 # Audio-mode settings remembered between sessions (in the presets file).
@@ -177,7 +178,8 @@ class App:
         self.input_mode = self.audio_prefs.get("input_mode", "ndi")
         if self.input_mode == "audio" and speech is None:
             self.input_mode = "ndi"
-        self.audio_devices = []
+        self.audio_devices = []  # sound devices + NDI sources, see _rebuild_audio_inputs
+        self._sound_inputs = []
         self.output_devices = []
         self.voice_tuning = (
             tts.VoiceTuning(
@@ -795,29 +797,60 @@ class App:
         if rescan:
             self._stop_monitor()  # rescanning restarts PortAudio under open streams
         try:
-            self.audio_devices = audio_io.list_input_devices(rescan=rescan)
+            self._sound_inputs = audio_io.list_input_devices(rescan=rescan)
         except Exception as e:
             self._append_log(f"Could not list audio devices: {e}")
-            self.audio_devices = []
-        labels = [label for _idx, label, _ch in self.audio_devices]
-        self.audio_device_combo["values"] = labels
+            self._sound_inputs = []
+        self._rebuild_audio_inputs()
         current = self.audio_device_var.get()
-        if current not in labels:
+        labels = [label for _ref, label, _ch in self.audio_devices]
+        if current not in labels and not current.startswith(NDI_INPUT_PREFIX):
             default_idx = audio_io.default_input_device()
-            default = next((lbl for idx, lbl, _ch in self.audio_devices if idx == default_idx), None)
+            default = next((lbl for ref, lbl, _ch in self.audio_devices if ref == default_idx), None)
             self.audio_device_var.set(default or (labels[0] if labels else ""))
         if rescan:
-            self._append_log(f"{len(labels)} audio input device(s) found.")
+            self._append_log(f"{len(self._sound_inputs)} audio input device(s) found.")
         self._on_audio_device_change()
         if hasattr(self, "voice_device_combo"):
             self._refresh_output_devices()
 
+    def _rebuild_audio_inputs(self):
+        """The audio input list: sound devices, then the NDI sources on the
+        network (their audio is received directly, no virtual device
+        needed). Entries are (ref, label, max channels), ref being a sound
+        device index or an NDI source."""
+        ndi_inputs = [
+            (src, f"{NDI_INPUT_PREFIX}{src.ndi_name}", audio_io.NDI_MAX_CHANNELS) for src in self.sources
+        ]
+        self.audio_devices = self._sound_inputs + ndi_inputs
+        self.audio_device_combo["values"] = [label for _ref, label, _ch in self.audio_devices]
+
+    def _on_sources_changed(self):
+        """NDI discovery found/lost sources: refresh the NDI entries of the
+        audio input list. A saved NDI selection that wasn't on the network
+        yet (e.g. at startup) starts its level meter once it shows up."""
+        if speech is None:
+            return
+        was_resolved = self._selected_audio_device()[0] is not None
+        self._rebuild_audio_inputs()
+        if not was_resolved and self._selected_audio_device()[0] is not None:
+            self._on_audio_device_change()
+
     def _selected_audio_device(self):
         label = self.audio_device_var.get()
-        return next(((idx, ch) for idx, lbl, ch in self.audio_devices if lbl == label), (None, 0))
+        return next(((ref, ch) for ref, lbl, ch in self.audio_devices if lbl == label), (None, 0))
+
+    def _open_audio_input(self, meter_only):
+        """A capture of the selected input (sound device or NDI source)."""
+        ref, _max_ch = self._selected_audio_device()
+        channel = self.audio_channel_var.get()
+        channel = None if channel == CHANNEL_MIX_LABEL else int(channel) - 1
+        if isinstance(ref, int):
+            return audio_io.AudioCapture(ref, channel, meter_only=meter_only)
+        return audio_io.NDIAudioCapture(ref, channel, meter_only=meter_only)
 
     def _on_audio_device_change(self, event=None):
-        _idx, max_ch = self._selected_audio_device()
+        _ref, max_ch = self._selected_audio_device()
         values = [CHANNEL_MIX_LABEL] + [str(i) for i in range(1, max_ch + 1)]
         self.audio_channel_combo["values"] = values
         if self.audio_channel_var.get() not in values:
@@ -835,14 +868,10 @@ class App:
         self._stop_monitor()
         if audio_io is None or self.input_mode != "audio" or (self.worker and self.worker.is_alive()):
             return
-        device_index, _max_ch = self._selected_audio_device()
-        if device_index is None:
+        if self._selected_audio_device()[0] is None:
             return
-        channel = self.audio_channel_var.get()
         try:
-            self._monitor = audio_io.AudioCapture(
-                device_index, None if channel == CHANNEL_MIX_LABEL else int(channel) - 1, meter_only=True
-            )
+            self._monitor = self._open_audio_input(meter_only=True)
             self._monitor.start()
         except Exception as e:
             self._monitor = None
@@ -869,13 +898,15 @@ class App:
         self.root.after(int(LEVEL_INTERVAL_S * 1000), self._poll_monitor, gen)
 
     def _speech_settings(self):
-        device_index, _max_ch = self._selected_audio_device()
-        if device_index is None:
+        ref, _max_ch = self._selected_audio_device()
+        if ref is None:
             return None
         channel = self.audio_channel_var.get()
+        is_device = isinstance(ref, int)
         return speech.SpeechSettings(
             engine=self._engine_code(),
-            device_index=device_index,
+            device_index=ref if is_device else None,
+            ndi_source=None if is_device else ref,
             channel=None if channel == CHANNEL_MIX_LABEL else int(channel) - 1,
             source_lang=self._source_lang_code(),
             target_lang=self._target_lang_code(),
@@ -2000,7 +2031,11 @@ class App:
         if self.input_mode == "audio":
             settings = self._speech_settings()
             if settings is None:
-                self._append_log("Select an audio input device before starting.")
+                label = self.audio_device_var.get()
+                if label.startswith(NDI_INPUT_PREFIX):
+                    self._append_log(f"NDI source '{label[len(NDI_INPUT_PREFIX):]}' isn't on the network (yet).")
+                else:
+                    self._append_log("Select an audio input device before starting.")
                 return
             voice_settings = self._voice_settings()
             if voice_settings is not None and voice_settings.lang != settings.target_lang:
@@ -2250,6 +2285,7 @@ class App:
 
         if {s.ndi_name for s in sources} != previous_names:
             self._append_log(f"{len(names)} source(s) found.")
+            self._on_sources_changed()
         self._update_source_card()
 
     def _append_log(self, text):

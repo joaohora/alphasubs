@@ -61,6 +61,8 @@ HALLUCINATION_MARKERS = (
 class SpeechSettings:
     engine: str = "local"  # "local" | "azure"
     device_index: int = None
+    # An NDI source to take the audio from instead of a sound device.
+    ndi_source: object = None
     channel: int = None  # 0-based, or None = mix of the first two channels
     source_lang: str = "auto"  # "auto" | one of LANGS
     target_lang: str = "pt"  # "pt" | "en"
@@ -131,9 +133,12 @@ class _Engine:
 
     def _open_capture(self):
         s = self.settings
-        if s.device_index is None:
+        if s.ndi_source is not None:
+            self.capture = audio_io.NDIAudioCapture(s.ndi_source, s.channel)
+        elif s.device_index is None:
             raise RuntimeError("No audio input device selected.")
-        self.capture = audio_io.AudioCapture(s.device_index, s.channel)
+        else:
+            self.capture = audio_io.AudioCapture(s.device_index, s.channel)
         self.capture.start()
 
     def _thread_main(self):

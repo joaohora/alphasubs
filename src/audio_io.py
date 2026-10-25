@@ -1,13 +1,17 @@
-"""Audio input devices (PortAudio, via sounddevice): discovery and capture as
-16 kHz mono float32 — the format the speech engines expect."""
+"""Audio inputs: sound devices (PortAudio, via sounddevice) and the audio of
+NDI sources, both captured as 16 kHz mono float32 — the format the speech
+engines expect."""
 
 import queue
+import threading
 
 import numpy as np
 import sounddevice as sd
 
 SAMPLE_RATE = 16000
 BLOCK_S = 0.05
+# NDI sources don't announce their audio channel count up front.
+NDI_MAX_CHANNELS = 8
 # WDM-KS devices on Windows are the same hardware already listed under
 # MME/DirectSound/WASAPI, and tend to fail to open in shared use.
 SKIPPED_HOSTAPIS = ("Windows WDM-KS",)
@@ -129,8 +133,7 @@ class AudioCapture:
             mono = indata.mean(axis=1)
         else:
             mono = indata[:, self.channel]
-        rms = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
-        self.level_db = 20.0 * np.log10(max(rms, 1e-6))
+        self.level_db = _level_db(mono)
         if self.meter_only:
             return
         try:
@@ -147,15 +150,9 @@ class AudioCapture:
         timeout. Draining the whole queue matters: a consumer that is slower
         than real time (e.g. a transcription pass) must catch up on its next
         read instead of falling further behind one block at a time."""
-        try:
-            blocks = [self._q.get(timeout=timeout)]
-        except queue.Empty:
+        blocks = _drain(self._q, timeout)
+        if blocks is None:
             return None
-        while True:
-            try:
-                blocks.append(self._q.get_nowait())
-            except queue.Empty:
-                break
         return self._resampler.process(np.concatenate(blocks))
 
     def close(self):
@@ -163,3 +160,91 @@ class AudioCapture:
             self._stream.stop()
         finally:
             self._stream.close()
+
+
+def _level_db(mono):
+    rms = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
+    return 20.0 * np.log10(max(rms, 1e-6))
+
+
+def _drain(q, timeout):
+    """All blocks queued in `q`, waiting up to `timeout` for the first one;
+    None if nothing arrived."""
+    try:
+        blocks = [q.get(timeout=timeout)]
+    except queue.Empty:
+        return None
+    while True:
+        try:
+            blocks.append(q.get_nowait())
+        except queue.Empty:
+            return blocks
+
+
+class NDIAudioCapture:
+    """Same interface as AudioCapture, for the audio of an NDI source — so
+    an NDI feed can be captioned directly, without routing it through a
+    virtual audio device. Receives audio only (no video over the network).
+    `channel` is 0-based, or None to mix the first two channels."""
+
+    def __init__(self, source, channel=None, meter_only=False):
+        import NDIlib as ndi
+
+        self._ndi = ndi
+        create = ndi.RecvCreateV3()
+        create.bandwidth = ndi.RECV_BANDWIDTH_AUDIO_ONLY
+        create.ndi_recv_name = "AlphaSubs Audio Receiver"
+        self._recv = ndi.recv_create_v3(create)
+        if self._recv is None:
+            raise RuntimeError("Failed to create the NDI audio receiver.")
+        ndi.recv_connect(self._recv, source)
+        self.channel = channel
+        self.meter_only = meter_only
+        self.level_db = -120.0
+        self._q = queue.Queue(maxsize=400)
+        self._rate = None
+        self._resampler = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _loop(self):
+        ndi = self._ndi
+        while not self._stop.is_set():
+            frame_type, video, audio, _meta = ndi.recv_capture_v2(self._recv, 200, want_metadata=False)
+            if frame_type == ndi.FRAME_TYPE_AUDIO:
+                data = np.array(audio.data, dtype=np.float32, copy=True)  # planar: (channels, samples)
+                rate = int(audio.sample_rate)
+                ndi.recv_free_audio_v2(self._recv, audio)
+                if data.ndim == 1:
+                    data = data[None, :]
+                if self.channel is not None and self.channel < data.shape[0]:
+                    mono = data[self.channel]
+                else:
+                    mono = data[:2].mean(axis=0)
+                self.level_db = _level_db(mono)
+                if not self.meter_only:
+                    try:
+                        self._q.put_nowait((rate, mono))
+                    except queue.Full:
+                        pass  # consumer stalled: drop audio rather than grow without bound
+            elif frame_type == ndi.FRAME_TYPE_VIDEO:
+                ndi.recv_free_video_v2(self._recv, video)
+
+    def read(self, timeout=0.1):
+        """Like AudioCapture.read(): all audio received since the last call,
+        at 16 kHz, or None if nothing arrived within the timeout."""
+        blocks = _drain(self._q, timeout)
+        if blocks is None:
+            return None
+        rate = blocks[-1][0]
+        if rate != self._rate:
+            self._rate, self._resampler = rate, _Resampler(rate)
+        return self._resampler.process(np.concatenate([b for r, b in blocks if r == rate]))
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._ndi.recv_destroy(self._recv)
