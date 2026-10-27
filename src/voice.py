@@ -43,6 +43,33 @@ AZURE_VOICES = {
     "pt": ("pt-PT-RaquelNeural", "pt-PT-DuarteNeural", "pt-PT-FernandaNeural"),
     "en": ("en-GB-SoniaNeural", "en-GB-RyanNeural", "en-US-JennyNeural", "en-US-GuyNeural"),
 }
+# Soniox voices speak every language, each with its own accent: per
+# language, the voices of that origin (judged by their names); other
+# languages get a neutral selection.
+SONIOX_VOICES = {
+    "pt": ("Matilde", "Duarte", "Rui", "Nuno", "Diogo", "Bernardo"),
+    "en": ("Victoria", "Daniel", "Oliver", "Isla", "Grace", "Adrian"),
+    "es": ("Lucia", "Rafael", "Carmen", "Javier", "Marta", "Sergio", "Alvaro", "Hector"),
+    "fr": ("Camille", "Julien", "Elodie", "Olivier", "Manon", "Antoine", "Celine", "Mathieu"),
+    "de": ("Lena", "Stefan", "Annika", "Tobias", "Marlene", "Konrad", "Jonas", "Matthias"),
+    "it": ("Giulia", "Marco", "Valeria", "Riccardo", "Alessandro", "Davide"),
+    "uk": ("Yana", "Taras", "Bohdan"),
+    "ru": ("Yana", "Andrei", "Kirill", "Vadim"),
+    "pl": ("Marek", "Szymon"),
+    "ar": ("Layla", "Faisal", "Rania", "Yousef", "Hind", "Karim"),
+    "zh": ("Meilin", "Wei", "Haoran", "Zihan"),
+    "ja": ("Aoi", "Kenji", "Yuki", "Haruto", "Sakura", "Sota"),
+    "ko": ("Mina", "Jihoon", "Jiwoo", "Minjun"),
+    "hi": ("Priya", "Arjun", "Kavya", "Rohan", "Ishita", "Kabir"),
+    "vi": ("Linh", "Mai", "Huong"),
+    "id": ("Nurul", "Bayu", "Budi", "Rizky"),
+    "tl": ("Maricel",),
+}
+SONIOX_VOICES_OTHER = ("Victoria", "Daniel", "Grace", "Adrian", "Lucia", "Rafael")
+SONIOX_TTS_URL = "https://tts-rt.soniox.com/tts"
+SONIOX_TTS_MODEL = "tts-rt-v2"
+SONIOX_SPEED_RANGE = (0.7, 1.3)
+SONIOX_CHUNK_BYTES = 9600  # 0.2 s at 24 kHz, 16-bit
 # Natural, continuous speech is faster than a synthetic voice, so the voice
 # speeds up progressively with the pending backlog: +SPEEDUP_PER_S per second
 # of backlog above SPEEDUP_START_S, up to SPEEDUP_MAX. Only a sentence that
@@ -55,13 +82,15 @@ CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
 
 
 def voices_for(engine, lang):
+    if engine == "soniox":
+        return SONIOX_VOICES.get(lang, SONIOX_VOICES_OTHER)
     table = AZURE_VOICES if engine == "azure" else PIPER_VOICES
     return table.get(lang, ())
 
 
 @dataclass
 class VoiceSettings:
-    engine: str = "off"  # "off" | "local" | "azure"
+    engine: str = "off"  # "off" | "local" | "azure" | "soniox"
     voice: str = ""
     # Language the voice speaks (may differ from the captions'). When the
     # recognizer didn't already provide it, the source text is translated
@@ -72,6 +101,7 @@ class VoiceSettings:
     ndi: bool = False  # also send the voice as the NDI output's audio
     azure_key: str = ""
     azure_region: str = ""
+    soniox_key: str = ""
 
 
 @dataclass
@@ -102,6 +132,48 @@ def _resample(x, in_rate, out_rate):
     except Exception:
         n_out = int(round(len(x) * out_rate / in_rate))
         return np.interp(np.linspace(0, len(x) - 1, n_out), np.arange(len(x)), x).astype(np.float32)
+
+
+class _StreamResampler:
+    """Resamples one sentence that arrives in chunks (libswresample via
+    PyAV, kept open so the chunks join without clicks), with a one-shot
+    fallback at the end."""
+
+    def __init__(self, in_rate, out_rate):
+        self.in_rate, self.out_rate = in_rate, out_rate
+        self._av = None
+        self._held = []
+        if in_rate != out_rate:
+            try:
+                import av
+
+                self._av = av
+                self._resampler = av.AudioResampler(format="flt", layout="mono", rate=out_rate)
+            except Exception:
+                self._av = None
+
+    def process(self, x):
+        if self.in_rate == self.out_rate:
+            return x
+        if self._av is None:
+            self._held.append(x)
+            return np.zeros(0, np.float32)
+        frame = self._av.AudioFrame.from_ndarray(x.astype(np.float32)[None, :], format="flt", layout="mono")
+        frame.sample_rate = self.in_rate
+        return self._join(self._resampler.resample(frame))
+
+    def flush(self):
+        if self.in_rate == self.out_rate:
+            return np.zeros(0, np.float32)
+        if self._av is None:
+            return _resample(np.concatenate(self._held), self.in_rate, self.out_rate) if self._held else np.zeros(0, np.float32)
+        return self._join(self._resampler.resample(None))
+
+    @staticmethod
+    def _join(frames):
+        if not frames:
+            return np.zeros(0, np.float32)
+        return np.concatenate([f.to_ndarray().reshape(-1) for f in frames]).astype(np.float32)
 
 
 def _download_piper_voice(name, log):
@@ -187,6 +259,59 @@ class _AzureSynth:
             details = getattr(result, "cancellation_details", None)
             raise RuntimeError(getattr(details, "error_details", None) or f"Azure TTS failed ({result.reason}).")
         return np.frombuffer(result.audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+class _SonioxSynth:
+    """Soniox text-to-speech over its REST API: one request per sentence,
+    raw 16-bit PCM back."""
+
+    rate = 24000
+
+    def __init__(self, name, lang, key):
+        if not key.strip():
+            raise RuntimeError("Soniox voices need the Soniox key (Input panel).")
+        self._name = name
+        self._lang = lang
+        self._key = key.strip()
+
+    def stream(self, text, speed):
+        """Yields the audio as it arrives: the first ~0.1 s after ~0.5 s,
+        then faster than real time — the voice starts playing at once
+        instead of after the whole sentence (~4 s for a long one)."""
+        import json
+        import urllib.error
+
+        body = {
+            "model": SONIOX_TTS_MODEL, "language": self._lang, "voice": self._name,
+            "audio_format": "pcm_s16le", "sample_rate": self.rate, "text": text,
+            "speed": min(SONIOX_SPEED_RANGE[1], max(SONIOX_SPEED_RANGE[0], speed)),
+        }
+        request = urllib.request.Request(
+            SONIOX_TTS_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+            # Soniox's firewall rejects urllib's default User-Agent (403).
+            headers={
+                "Content-Type": "application/json", "Authorization": f"Bearer {self._key}",
+                "User-Agent": "AlphaSubs",
+            },
+        )
+        try:
+            resp = urllib.request.urlopen(request, timeout=15)
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read()).get("error_message", "")
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"Soniox TTS error {e.code}: {detail or e.reason}")
+        with resp:
+            odd = b""
+            while True:
+                data = resp.read1(SONIOX_CHUNK_BYTES)
+                if not data:
+                    return
+                data = odd + data
+                cut = len(data) // 2 * 2
+                data, odd = data[:cut], data[cut:]
+                yield np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 class _AudioBuffer:
@@ -311,6 +436,8 @@ class VoiceOutput:
         try:
             if s.engine == "azure":
                 synth = _AzureSynth(s.voice, s.azure_key, s.azure_region)
+            elif s.engine == "soniox":
+                synth = _SonioxSynth(s.voice, s.lang, s.soniox_key)
             else:
                 synth = _PiperSynth(s.voice, self.log)
             for src in s.source_langs:
@@ -338,15 +465,35 @@ class VoiceOutput:
                 text = self._text_for(info)
                 if not text:
                     continue
-                pcm = synth.synth(text, speed)
+                if hasattr(synth, "stream"):
+                    self._play(synth, synth.stream(text, speed))
+                else:
+                    pcm = synth.synth(text, speed)
+                    for buf in self._buffers:
+                        buf.append(_resample(pcm, synth.rate, buf.rate))
+                    self._feed_listener(synth.rate, pcm)
             except Exception as e:
                 self.log(f"Voice error: {e}")
-                continue
-            for buf in self._buffers:
-                buf.append(_resample(pcm, synth.rate, buf.rate))
-            listener = self.listener
-            if listener is not None:
-                listener.feed(synth.rate, pcm * self._gain())
+
+    def _play(self, synth, chunks):
+        """Queues a sentence on the outputs chunk by chunk, as it's
+        synthesized."""
+        resamplers = [(buf, _StreamResampler(synth.rate, buf.rate)) for buf in self._buffers]
+        try:
+            for pcm in chunks:
+                if self._stop.is_set() or self.tuning.muted:
+                    return
+                for buf, resampler in resamplers:
+                    buf.append(resampler.process(pcm))
+                self._feed_listener(synth.rate, pcm)
+        finally:
+            for buf, resampler in resamplers:
+                buf.append(resampler.flush())
+
+    def _feed_listener(self, rate, pcm):
+        listener = self.listener
+        if listener is not None:
+            listener.feed(rate, pcm * self._gain())
 
     def _gain(self):
         return 0.0 if self.tuning.muted else self.tuning.volume

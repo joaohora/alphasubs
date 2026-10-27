@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
+import languages
 import ndi_io
 from captions import CaptionBoard, CaptionConfig, load_font, render_keyed_captions
 from compositor import FPS_PRESETS, KeyerConfig, OutputConfig, place_on_canvas, process_frame
@@ -61,9 +62,16 @@ OUTPUT_ATTRS = ("canvas_w", "canvas_h", "fps_n", "fps_d", "scale", "pos_x_px", "
 CAPTION_ATTRS = ("font_size", "max_lines", "line_width_pct", "bottom_margin", "hold_s")
 
 INPUT_MODE_LABELS = {"ndi": "NDI video (key)", "audio": "Audio (speech-to-text)"}
-SOURCE_LANG_LABELS = {"auto": "Auto (EN / PT / ES)", "en": "English", "pt": "Português", "es": "Español"}
-TARGET_LANG_LABELS = {"pt": "Português", "en": "English"}
-ENGINE_LABELS = {"local": "Local (Whisper, offline)", "azure": "Cloud (Azure Speech)"}
+# Language choices depend on the engine (see languages.py).
+AUTO_LANG_LABELS = {"basic": "Auto (EN / PT / ES)", "any": "Auto (any language)"}
+SAME_LANG_LABEL = "Same as subtitles"
+LANG_BY_LABEL = {languages.label(code): code for code in languages.ALL}
+ENGINE_LABELS = {
+    "local": "Local (Whisper, offline)", "azure": "Cloud (Azure Speech)",
+    "soniox": "Cloud (Soniox)", "speechmatics": "Cloud (Speechmatics)",
+}
+ENGINE_SHORT = {"local": "Local", "azure": "Azure", "soniox": "Soniox", "speechmatics": "Speechmatics"}
+TRANSLATION_LABELS = {"engine": "By the engine", "claude": "Claude (with context, pt-PT)"}
 WHISPER_MODELS = ("auto", "large-v3-turbo", "large-v3", "medium", "small", "base")
 CHANNEL_MIX_LABEL = "Mix (1+2)"
 NDI_INPUT_PREFIX = "NDI: "
@@ -72,15 +80,17 @@ CARD_TEXT_W = 175  # a module card's text width (its labels wrap at 180 px)
 LEVEL_INTERVAL_S = 0.1
 # The app's configuration beyond the look — input, recognition, voice and the
 # output name. Saved in each preset (under "_app") and, together with the
-# Azure key/region (app-wide, never in presets), as the last session.
+# API keys (app-wide, never in presets), as the last session.
 APP_SETTING_KEYS = (
     "input_mode", "ndi_source_name", "output_name",
     "device_label", "channel", "source_lang", "target_lang", "engine", "whisper_model", "hotwords",
+    "translation", "claude_model",
     "voice_engine", "voice_name", "voice_lang", "voice_device_label", "voice_ndi",
     "voice_speed", "voice_volume", "voice_buffer_ms",
 )
-VOICE_ENGINE_LABELS = {"off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)"}
-VOICE_LANG_LABELS = {"same": "Same as subtitles", "pt": "Português", "en": "English"}
+VOICE_ENGINE_LABELS = {
+    "off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)", "soniox": "Cloud (Soniox)",
+}
 NO_DEVICE_LABEL = "None"
 POS_RANGE = 1000
 BOX_SIZE_MAX = 3840
@@ -565,7 +575,9 @@ class App:
                     device = device[:-1]
                 device = device.rstrip() + "…"
             src = self._source_lang_code().upper()
-            engine = "Azure" if self._engine_code() == "azure" else "Local"
+            engine = ENGINE_SHORT[self._engine_code()]
+            if self._translation_code() == "claude":
+                engine += " + Claude"
             self.source_card_var.set(f"{device}\n{src} → {self._target_lang_code().upper()} · {engine}")
             return
         self.source_title_var.set("NDI SOURCE")
@@ -723,17 +735,14 @@ class App:
         lang_row = ttk.Frame(frame)
         lang_row.grid(row=2, column=1, columnspan=2, sticky="we", padx=4, pady=2)
         ttk.Label(frame, text="Spoken language:").grid(row=2, column=0, sticky="w", pady=2)
-        self.source_lang_var = tk.StringVar(
-            value=SOURCE_LANG_LABELS.get(prefs.get("source_lang"), SOURCE_LANG_LABELS["auto"])
-        )
-        combo(lang_row, self.source_lang_var, list(SOURCE_LANG_LABELS.values()), 18).pack(side="left")
+        # The choices are filled in by _refresh_lang_choices, per engine.
+        self.source_lang_var = tk.StringVar(value=self._lang_label(prefs.get("source_lang", "auto")))
+        self.source_lang_combo = combo(lang_row, self.source_lang_var, [], 18)
+        self.source_lang_combo.pack(side="left")
         ttk.Label(lang_row, text="   Subtitles in:").pack(side="left")
-        self.target_lang_var = tk.StringVar(
-            value=TARGET_LANG_LABELS.get(prefs.get("target_lang"), TARGET_LANG_LABELS["pt"])
-        )
-        combo(
-            lang_row, self.target_lang_var, list(TARGET_LANG_LABELS.values()), 11, self._on_target_lang_change
-        ).pack(side="left", padx=6)
+        self.target_lang_var = tk.StringVar(value=self._lang_label(prefs.get("target_lang", "pt")))
+        self.target_lang_combo = combo(lang_row, self.target_lang_var, [], 12, self._on_target_lang_change)
+        self.target_lang_combo.pack(side="left", padx=6)
 
         ttk.Label(frame, text="Engine:").grid(row=3, column=0, sticky="w", pady=2)
         self.engine_var = tk.StringVar(value=ENGINE_LABELS.get(prefs.get("engine"), ENGINE_LABELS["local"]))
@@ -760,32 +769,105 @@ class App:
         self.azure_region_var = tk.StringVar(value=prefs.get("azure_region", "westeurope"))
         entry(self.azure_engine_frame, self.azure_region_var, width=14).pack(side="left", padx=6)
 
-        ttk.Label(frame, text="Names / terms:").grid(row=5, column=0, sticky="w", pady=2)
+        self.key_engine_frames = {}
+        for code, service in (("soniox", "Soniox"), ("speechmatics", "Speechmatics")):
+            key_frame = ttk.Frame(frame)
+            key_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=2)
+            ttk.Label(key_frame, text=f"{service} key:").pack(side="left")
+            var = tk.StringVar(value=prefs.get(f"{code}_key", ""))
+            entry(key_frame, var, show="•", width=40).pack(side="left", padx=6)
+            setattr(self, f"{code}_key_var", var)
+            self.key_engine_frames[code] = key_frame
+        ttk.Label(
+            self.key_engine_frames["speechmatics"], text="needs the spoken language (no Auto)", foreground=MUTED_FG,
+        ).pack(side="left", padx=6)
+
+        ttk.Label(frame, text="Translation:").grid(row=5, column=0, sticky="w", pady=2)
+        trans_row = ttk.Frame(frame)
+        trans_row.grid(row=5, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        self.translation_var = tk.StringVar(
+            value=TRANSLATION_LABELS.get(prefs.get("translation"), TRANSLATION_LABELS["engine"])
+        )
+        combo(trans_row, self.translation_var, list(TRANSLATION_LABELS.values()), 26, self._on_engine_change).pack(
+            side="left"
+        )
+        self.claude_frame = ttk.Frame(frame)
+        self.claude_frame.grid(row=6, column=0, columnspan=3, sticky="we", pady=2)
+        ttk.Label(self.claude_frame, text="Claude key:").pack(side="left")
+        self.claude_key_var = tk.StringVar(value=prefs.get("claude_key", ""))
+        entry(self.claude_frame, self.claude_key_var, show="•", width=28).pack(side="left", padx=6)
+        ttk.Label(self.claude_frame, text="Model:").pack(side="left")
+        claude_models = speech.CLAUDE_MODELS if speech is not None else ("claude-opus-5-5",)
+        self.claude_model_var = tk.StringVar(
+            value=prefs.get("claude_model") if prefs.get("claude_model") in claude_models else claude_models[0]
+        )
+        combo(self.claude_frame, self.claude_model_var, list(claude_models), 18).pack(side="left", padx=6)
+        ttk.Label(
+            self.claude_frame, text="sentences only (no live partials)", foreground=MUTED_FG,
+        ).pack(side="left", padx=6)
+
+        ttk.Label(frame, text="Names / terms:").grid(row=7, column=0, sticky="w", pady=2)
         self.hotwords_var = tk.StringVar(value=prefs.get("hotwords", ""))
-        entry(frame, self.hotwords_var).grid(row=5, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        entry(frame, self.hotwords_var).grid(row=7, column=1, columnspan=2, sticky="we", padx=4, pady=2)
         ttk.Label(
             frame, text="Comma-separated, e.g. Gulbenkian, Coro Gulbenkian — helps recognize names.",
             foreground=MUTED_FG,
-        ).grid(row=6, column=1, columnspan=2, sticky="w", padx=4)
+        ).grid(row=8, column=1, columnspan=2, sticky="w", padx=4)
 
         if speech is None:
             ttk.Label(
                 frame, text=f"Audio mode unavailable: {AUDIO_IMPORT_ERROR}", foreground=REC_BG,
-            ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
         else:
             self._refresh_audio_devices()
         self._show_engine_frames()
+        self._refresh_lang_choices()
 
     # ---------- Input mode (NDI video / audio) ----------
 
+    @staticmethod
+    def _lang_label(code):
+        if code == "auto":
+            return AUTO_LANG_LABELS["basic"]
+        if code == "same":
+            return SAME_LANG_LABEL
+        return languages.label(code)
+
+    @staticmethod
+    def _lang_code(label, default):
+        if label in AUTO_LANG_LABELS.values():
+            return "auto"
+        if label == SAME_LANG_LABEL:
+            return "same"
+        return LANG_BY_LABEL.get(label, default)
+
     def _source_lang_code(self):
-        return next((k for k, v in SOURCE_LANG_LABELS.items() if v == self.source_lang_var.get()), "auto")
+        return self._lang_code(self.source_lang_var.get(), "auto")
 
     def _target_lang_code(self):
-        return next((k for k, v in TARGET_LANG_LABELS.items() if v == self.target_lang_var.get()), "pt")
+        return self._lang_code(self.target_lang_var.get(), "pt")
+
+    def _refresh_lang_choices(self):
+        """Offers the spoken and subtitle languages the engine (and the
+        translation) supports; a choice no longer available falls back to
+        Auto / Portuguese."""
+        engine = self._engine_code()
+        auto = AUTO_LANG_LABELS["any" if engine == "soniox" else "basic"]
+        spoken = languages.ordered(languages.spoken(engine))
+        self.source_lang_combo["values"] = [auto] + [languages.label(c) for c in spoken]
+        source = self._source_lang_code()
+        self.source_lang_var.set(languages.label(source) if source in spoken else auto)
+        targets = languages.ordered(languages.subtitles(engine, self._translation_code()))
+        self.target_lang_combo["values"] = [languages.label(c) for c in targets]
+        target = self._target_lang_code()
+        self.target_lang_var.set(languages.label(target if target in targets else "pt"))
+        self._on_target_lang_change()
 
     def _engine_code(self):
         return next((k for k, v in ENGINE_LABELS.items() if v == self.engine_var.get()), "local")
+
+    def _translation_code(self):
+        return next((k for k, v in TRANSLATION_LABELS.items() if v == self.translation_var.get()), "engine")
 
     def _on_input_mode_change(self, event=None):
         mode = next((k for k, v in INPUT_MODE_LABELS.items() if v == self.input_mode_var.get()), "ndi")
@@ -825,15 +907,20 @@ class App:
 
     def _on_engine_change(self, event=None):
         self._show_engine_frames()
-        self._update_source_card()
+        self._refresh_lang_choices()
 
     def _show_engine_frames(self):
-        if self._engine_code() == "azure":
-            self.local_engine_frame.grid_remove()
-            self.azure_engine_frame.grid()
+        code = self._engine_code()
+        frames = {"local": self.local_engine_frame, "azure": self.azure_engine_frame, **self.key_engine_frames}
+        for key, frame in frames.items():
+            if key == code:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        if self._translation_code() == "claude":
+            self.claude_frame.grid()
         else:
-            self.azure_engine_frame.grid_remove()
-            self.local_engine_frame.grid()
+            self.claude_frame.grid_remove()
 
     def _refresh_audio_devices(self, rescan=False):
         if speech is None:
@@ -1072,6 +1159,11 @@ class App:
             hotwords=self.hotwords_var.get(),
             azure_key=self.azure_key_var.get(),
             azure_region=self.azure_region_var.get(),
+            soniox_key=self.soniox_key_var.get(),
+            speechmatics_key=self.speechmatics_key_var.get(),
+            translation=self._translation_code(),
+            claude_key=self.claude_key_var.get(),
+            claude_model=self.claude_model_var.get(),
         )
 
     def _update_level_meter(self, level_db):
@@ -1090,9 +1182,10 @@ class App:
             widget.config(state="disabled" if locked else state)
 
     def _on_target_lang_change(self, event=None):
-        self._update_source_card()
-        if hasattr(self, "voice_name_combo"):
-            self._refresh_voice_names()
+        if hasattr(self, "source_card_var"):
+            self._update_source_card()
+        if hasattr(self, "voice_lang_combo"):
+            self._refresh_voice_langs()
 
     # ---------- Voice (translated speech output) ----------
 
@@ -1124,12 +1217,9 @@ class App:
         )
 
         ttk.Label(frame, text="Voice language:").grid(row=1, column=0, sticky="w", pady=2)
-        self.voice_lang_var = tk.StringVar(
-            value=VOICE_LANG_LABELS.get(prefs.get("voice_lang"), VOICE_LANG_LABELS["same"])
-        )
-        combo(self.voice_lang_var, list(VOICE_LANG_LABELS.values()), 18, self._on_voice_engine_change).grid(
-            row=1, column=1, sticky="w", padx=4, pady=2
-        )
+        self.voice_lang_var = tk.StringVar(value=self._lang_label(prefs.get("voice_lang", "same")))
+        self.voice_lang_combo = combo(self.voice_lang_var, [], 18, lambda e: self._refresh_voice_names())
+        self.voice_lang_combo.grid(row=1, column=1, sticky="w", padx=4, pady=2)
 
         ttk.Label(frame, text="Speaker:").grid(row=2, column=0, sticky="w", pady=2)
         self.voice_name_var = tk.StringVar(value=prefs.get("voice_name", ""))
@@ -1165,26 +1255,37 @@ class App:
             " as it falls behind, and skips sentences only past 20 s of delay.",
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
-            "Azure voices use the key and region from the Input panel.",
+            "Azure and Soniox voices use the keys from the Input panel.",
             "If the voice still breaks up, raise the audio buffer (it adds that much delay).",
         ), start=8):
             ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
                 row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0)
             )
 
-        self._refresh_voice_names()
+        self._refresh_voice_langs()
         self._refresh_output_devices()
 
     def _voice_engine_code(self):
         return next((k for k, v in VOICE_ENGINE_LABELS.items() if v == self.voice_engine_var.get()), "off")
 
     def _on_voice_engine_change(self, event=None):
-        self._refresh_voice_names()
+        self._refresh_voice_langs()
+
+    def _voice_lang_choice(self):
+        return self._lang_code(self.voice_lang_var.get(), "same")
 
     def _voice_lang_code(self):
         """The language the voice speaks ("Same as subtitles" resolved)."""
-        code = next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same")
+        code = self._voice_lang_choice()
         return self._target_lang_code() if code == "same" else code
+
+    def _refresh_voice_langs(self):
+        langs = languages.ordered(languages.voices(self._voice_engine_code()))
+        self.voice_lang_combo["values"] = [SAME_LANG_LABEL] + [languages.label(c) for c in langs]
+        choice = self._voice_lang_choice()
+        if choice != "same" and choice not in langs:
+            self.voice_lang_var.set(SAME_LANG_LABEL)
+        self._refresh_voice_names()
 
     def _refresh_voice_names(self):
         names = list(tts.voices_for(self._voice_engine_code(), self._voice_lang_code())) if tts else []
@@ -1220,6 +1321,8 @@ class App:
         name = self.voice_name_var.get()
         if engine == "azure":
             speaker = f"{name[6:].replace('Neural', '')} (Azure)"
+        elif engine == "soniox":
+            speaker = f"{name} (Soniox)"
         else:
             speaker = f"{name.split('-')[1] if '-' in name else name} (local)"
         outputs = [o for o, on in (
@@ -1240,16 +1343,29 @@ class App:
                 "To only listen to it here, turn on the speaker on the VOICE card before Start."
             )
             return None
+        lang = self._voice_lang_code()
+        if not self.voice_name_var.get():
+            self._append_log(f"No {VOICE_ENGINE_LABELS[engine]} voice speaks {languages.label(lang)} — voice off.")
+            return None
+        # Offline translation for the voice is only needed (and only exists
+        # for EN/PT/ES) when nothing else provides the voice's language: the
+        # captions' translation covers it if it's the same language, Azure
+        # and Claude translate into a second language too.
         source = self._source_lang_code()
+        if lang == self._target_lang_code() or self._engine_code() == "azure" or self._translation_code() == "claude":
+            source_langs = ()
+        else:
+            source_langs = tuple(l for l in (speech.LANGS if source == "auto" else (source,)) if l in speech.LANGS)
         return tts.VoiceSettings(
             engine=engine,
             voice=self.voice_name_var.get(),
-            lang=self._voice_lang_code(),
-            source_langs=speech.LANGS if source == "auto" else (source,),
+            lang=lang,
+            source_langs=source_langs,
             device_index=device_index,
             ndi=self.voice_ndi_var.get(),
             azure_key=self.azure_key_var.get(),
             azure_region=self.azure_region_var.get(),
+            soniox_key=self.soniox_key_var.get(),
         )
 
     def _build_text_panel(self):
@@ -2091,11 +2207,13 @@ class App:
         return cfg, prefs
 
     def _save_audio_defaults(self):
-        """The last session: the whole app configuration + the Azure key and
-        region (app-wide) + the caption layout."""
+        """The last session: the whole app configuration + the API keys and
+        Azure region (app-wide) + the caption layout."""
         data = self._collect_app_settings()
         data["azure_key"] = self.azure_key_var.get()
         data["azure_region"] = self.azure_region_var.get()
+        for service in ("soniox", "speechmatics", "claude"):
+            data[f"{service}_key"] = getattr(self, f"{service}_key_var").get()
         data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         data["caption_bold"] = self.caption_cfg.bold
         data["caption_live"] = self.caption_cfg.live
@@ -2115,9 +2233,11 @@ class App:
             "engine": self._engine_code(),
             "whisper_model": self.whisper_model_var.get(),
             "hotwords": self.hotwords_var.get(),
+            "translation": self._translation_code(),
+            "claude_model": self.claude_model_var.get(),
             "voice_engine": self._voice_engine_code(),
             "voice_name": self.voice_name_var.get(),
-            "voice_lang": next((k for k, v in VOICE_LANG_LABELS.items() if v == self.voice_lang_var.get()), "same"),
+            "voice_lang": self._voice_lang_choice(),
             "voice_device_label": self.voice_device_var.get(),
             "voice_ndi": self.voice_ndi_var.get(),
         }
@@ -2137,20 +2257,29 @@ class App:
         if values.get("ndi_source_name"):
             self._select_ndi_source(values["ndi_source_name"])
         if speech is not None:
-            lang_vars = (
-                ("source_lang", self.source_lang_var, SOURCE_LANG_LABELS),
-                ("target_lang", self.target_lang_var, TARGET_LANG_LABELS),
+            choices = (
                 ("engine", self.engine_var, ENGINE_LABELS),
+                ("translation", self.translation_var, TRANSLATION_LABELS),
                 ("voice_engine", self.voice_engine_var, VOICE_ENGINE_LABELS),
-                ("voice_lang", self.voice_lang_var, VOICE_LANG_LABELS),
             )
-            for key, var, labels in lang_vars:
+            for key, var, labels in choices:
                 if values.get(key) in labels:
                     var.set(labels[values[key]])
+            # Languages the engine doesn't offer fall back in _refresh_lang_choices.
+            for key, var in (
+                ("source_lang", self.source_lang_var), ("target_lang", self.target_lang_var),
+                ("voice_lang", self.voice_lang_var),
+            ):
+                code = values.get(key)
+                if code in languages.NAMES or code in ("auto", "same"):
+                    var.set(self._lang_label(code))
             self._show_engine_frames()
+            self._refresh_lang_choices()
             for key, var in (("whisper_model", self.whisper_model_var), ("hotwords", self.hotwords_var)):
                 if key in values:
                     var.set(values[key])
+            if values.get("claude_model") in speech.CLAUDE_MODELS:
+                self.claude_model_var.set(values["claude_model"])
             if "device_label" in values:
                 self.audio_device_var.set(values["device_label"])
                 self._on_audio_device_change()

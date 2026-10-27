@@ -52,8 +52,8 @@ A preset holds the whole setup: the look (keying, text/shadow colors, box,
 caption layout, output resolution/fps/position) and the configuration
 (input type, NDI source or audio device/channel, spoken and caption
 languages, recognition engine and model, names/terms, voice settings and
-the NDI output name). The Azure key and region are app-wide and never
-stored in a preset.
+the NDI output name). The API keys (Azure, Soniox, Speechmatics, Claude)
+and the Azure region are app-wide and never stored in a preset.
 
 - Applied while **stopped**, everything changes at once.
 - Applied while **running**, the look changes immediately; the input,
@@ -127,9 +127,14 @@ card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
   The level meter (on the card and in the panel, in dB) shows the signal
   even before Start.
 - **Spoken language:** English, Português, Español, or *Auto* (detected per
-  sentence among the three).
-- **Subtitles in:** Português or English. Speech in another language is
-  translated.
+  sentence among the three). With Soniox: 60 languages, and *Auto* detects
+  any of them.
+- **Subtitles in:** Português or English. With Soniox (or Claude
+  translating): the 43 languages written left to right in the Latin,
+  Cyrillic or Greek alphabet, which the caption font can draw — not Arabic,
+  Hebrew, Persian, Urdu, Chinese, Japanese, Korean, Thai or the Indian
+  languages (they can still be spoken, or be the voice's language). Speech
+  in another language is translated.
 - **Engine:**
   - *Local (Whisper, offline)*: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
     for recognition plus offline [Argos Translate](https://github.com/argosopentech/argos-translate)
@@ -147,6 +152,22 @@ card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
     captioned sentence by sentence too. Short fragments left at long
     hesitations are joined to the next sentence. Captions typically arrive
     0.5–1 s after the end of each sentence.
+  - *Cloud (Soniox)*: streaming recognition and translation over a
+    WebSocket ([soniox.com](https://soniox.com), API key). Measured 0.5–1 s
+    from the end of a sentence to its caption, natural Portuguese from
+    Portugal. Billed by the minute while running — press Stop when done.
+  - *Cloud (Speechmatics)*: streaming recognition (EU endpoint, API key);
+    very accurate, ~2–2.5 s per sentence. It can't detect the language in
+    real time (choose the spoken language), and its own Portuguese
+    translation is Brazilian — use Claude for European Portuguese.
+  - With the cloud engines, the app reconnects by itself if the connection
+    drops.
+- **Translation:** *By the engine*, or *Claude (with context, pt-PT)*: the
+  engine only transcribes, and Claude (Anthropic API key, from
+  platform.claude.com — a claude.ai subscription doesn't include it)
+  translates each sentence with the previous ones as context, into
+  European Portuguese. Adds ~0.5–1.5 s per sentence; shows finished
+  sentences only. If Claude fails, the engine's own text is used.
 - **Names / terms:** comma-separated words to bias recognition (names of
   performers, works, institutions).
 
@@ -169,8 +190,11 @@ with the local engine on a CPU, less with a GPU or with Azure.
 In the audio mode, the translated text can also be spoken, while the
 captions keep working. Open the **VOICE** card:
 
-- **Voice:** *Off*, *Local (Piper, offline)*, or *Cloud (Azure neural)*.
-  Azure voices use the key and region from the Input panel.
+- **Voice:** *Off*, *Local (Piper, offline)*, *Cloud (Azure neural)* or
+  *Cloud (Soniox)*. Azure and Soniox voices use the keys from the Input
+  panel. Soniox voices speak 60 languages (each voice has its own accent:
+  Matilde and Duarte for Portuguese from Portugal) and start playing ~0.8 s
+  after a sentence arrives.
 - **Speaker:** the voices available for the subtitle language. Local voices
   (~65 MB each) download once, on first use.
 - **Output device:** a sound card output (headphones, interpretation
@@ -218,10 +242,11 @@ python3 src/main.py --source TEST-CAPTION-SRC --output-name "AlphaSubs"
 src/ndi_io.py       # thin wrapper over NDIlib: discovery, receiver, sender
 src/compositor.py   # luminance keying + shadow (pure numpy/OpenCV, testable in isolation)
 src/audio_io.py     # audio input devices + capture (16 kHz mono)
-src/speech.py       # speech engines: local Whisper and Azure Speech
+src/speech.py       # speech engines: local Whisper, Azure, Soniox, Speechmatics; Claude translation
+src/languages.py    # languages offered per engine
 src/translator.py   # offline EN/ES/PT translation (Argos models via CTranslate2)
 src/captions.py     # caption layout (roll-up lines) and rendering through the keyer
-src/voice.py        # translated voice: Piper/Azure TTS to an output device and/or NDI audio
+src/voice.py        # translated voice: Piper/Azure/Soniox TTS to an output device and/or NDI audio
 src/main.py         # CLI and main loop
 src/gui.py          # Tkinter GUI for operating without a terminal
 build_windows.bat   # builds dist\AlphaSubs.exe via PyInstaller (run on Windows)

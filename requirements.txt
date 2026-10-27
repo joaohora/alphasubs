@@ -11,6 +11,9 @@ sentencepiece>=0.2
 sacremoses>=0.1
 subword-nmt>=0.3.8
 azure-cognitiveservices-speech>=1.38
+# Cloud recognition (Soniox, Speechmatics) and Claude translation
+websockets>=13
+anthropic>=1.0
 # Translated voice (offline text-to-speech)
 piper-tts>=1.3
 # CUDA 12 / cuDNN 9 runtime for Whisper on NVIDIA GPUs (Windows). Large
