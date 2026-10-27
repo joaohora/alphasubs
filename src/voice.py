@@ -357,9 +357,10 @@ class VoiceOutput:
 
     def _ndi_loop(self):
         """Sends a continuous 48 kHz stereo stream (silence between
-        sentences) in frames of the buffer size. With SDK clocking each
-        send blocks until its slot, which paces the loop; without it (old
-        NDI bindings), the loop paces itself."""
+        sentences) in frames of the buffer size, paced on an absolute
+        schedule (not by SDK clocking, which would freeze the app — see
+        ndi_io.Sender). The SDK's synthesized timecodes follow the sample
+        count, so receivers still see an even stream."""
         n = int(NDI_RATE * self._buffer_s)
         next_t = time.perf_counter()
         while not self._stop.is_set():
@@ -369,10 +370,9 @@ class VoiceOutput:
             except Exception as e:
                 self.log(f"NDI audio error: {e}")
                 return
-            if not self._sender.audio_clocked:
-                next_t += n / NDI_RATE
-                delay = next_t - time.perf_counter()
-                if delay > 0:
-                    time.sleep(delay)
-                elif delay < -0.5:
-                    next_t = time.perf_counter()
+            next_t += n / NDI_RATE
+            delay = next_t - time.perf_counter()
+            if delay > 0:
+                self._stop.wait(delay)
+            elif delay < -0.5:
+                next_t = time.perf_counter()

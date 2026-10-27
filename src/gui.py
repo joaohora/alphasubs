@@ -2438,7 +2438,8 @@ class App:
         final sentence is also spoken (VoiceOutput runs its own threads)."""
         post = self.msg_queue.put
         try:
-            sender = ndi_io.Sender(output_name)
+            # Paced by this loop, not by the SDK (see ndi_io.Sender).
+            sender = ndi_io.Sender(output_name, clock_video=False)
         except Exception as e:
             post(("log", f"Failed to start: {e}"))
             post(("stopped", None))
@@ -2500,8 +2501,7 @@ class App:
                 sender.send(out_send, frame_rate_n=out_cfg.fps_n, frame_rate_d=out_cfg.fps_d)
                 frames += 1
 
-                # NDI's clock_video already paces send(); this only kicks in
-                # if it isn't available, so the loop never free-runs.
+                # Absolute schedule; the waits let the other threads run.
                 next_t += out_cfg.fps_d / max(1, out_cfg.fps_n)
                 delay = next_t - time.perf_counter()
                 if delay > 0:

@@ -129,16 +129,17 @@ class Sender:
     def __init__(self, name, clock_video=True):
         settings = ndi.SendCreate()
         settings.ndi_name = name
+        # SDK clocking makes each send wait for its slot — but ndi-python
+        # holds the Python interpreter lock (GIL) during that wait, freezing
+        # every other thread meanwhile (measured: ~one frame per video send,
+        # ~200 ms per voice audio frame, 800 ms stalls with both). So audio is
+        # never clocked (the voice paces itself), and clock_video is only for
+        # loops with nothing else to run, like the NDI key mode (paced by the
+        # source anyway). The audio mode paces its video loop itself.
         if hasattr(settings, "clock_video"):
-            # Makes the NDI SDK pace the send calls to the frame_rate_N/D given
-            # in each send(), instead of emitting as fast as frames arrive.
             settings.clock_video = clock_video
-        # Audio (the translated voice) relies on SDK clocking: each send waits
-        # until the previous frame's duration has elapsed, so timestamps stay
-        # regular however unevenly the sending thread runs (see voice.py).
-        self.audio_clocked = hasattr(settings, "clock_audio")
-        if self.audio_clocked:
-            settings.clock_audio = True
+        if hasattr(settings, "clock_audio"):
+            settings.clock_audio = False
         self._send = ndi.send_create(settings)
         if self._send is None:
             raise RuntimeError(
