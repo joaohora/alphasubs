@@ -6,6 +6,7 @@ and mute the NDI output without stopping the app — all without touching
 the terminal.
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -67,6 +68,7 @@ WHISPER_MODELS = ("auto", "large-v3-turbo", "large-v3", "medium", "small", "base
 CHANNEL_MIX_LABEL = "Mix (1+2)"
 NDI_INPUT_PREFIX = "NDI: "
 LEVEL_METER_W, LEVEL_METER_H = 140, 10
+CARD_TEXT_W = 175  # a module card's text width (its labels wrap at 180 px)
 LEVEL_INTERVAL_S = 0.1
 # The app's configuration beyond the look — input, recognition, voice and the
 # output name. Saved in each preset (under "_app") and, together with the
@@ -121,6 +123,10 @@ BUTTON_RADIUS = 3
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
+# pip output lines worth showing in the Log while an update installs
+# libraries, and how many last lines to show if it fails.
+PIP_LOG_PREFIXES = ("Collecting", "Installing", "Successfully", "ERROR")
+PIP_LOG_TAIL = 15
 
 
 def _bundle_base_dir():
@@ -195,6 +201,9 @@ class App:
         self._lock_while_running = []  # (widget, state to restore) for input settings
         self._monitor = None  # meter-only audio capture while stopped
         self._monitor_gen = 0
+        self._listening = False  # the monitor's audio also plays on the default output
+        self._listen_out = None
+        self._listen_btns = []
         # NDI (key mode) source from a preset / the last session, selected
         # once discovery finds it.
         self._wanted_ndi_source = self.audio_prefs.get("ndi_source_name") or None
@@ -213,6 +222,8 @@ class App:
         self._build_ui()
         self._lock_window_size()
         self._sources_thread.start()
+        if (REPO_ROOT / ".git").is_dir():
+            threading.Thread(target=self._startup_requirements_worker, daemon=True).start()
         self.root.after(80, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress-m>", self._toggle_mute)
@@ -449,14 +460,17 @@ class App:
         self._make_module_card(row, "VOICE", self.voice_card_var, self._open_voice_panel).pack(side="left")
 
     def _add_source_card_meter(self, inner):
-        """Extra content for the input card: a small input level meter, shown
-        in the audio mode so the signal can be checked at a glance (also
-        before Start)."""
+        """Extra content for the input card: a small input level meter and
+        the listen (speaker) toggle, shown in the audio mode so the signal
+        can be checked at a glance — and heard — before Start."""
+        self.card_level_row = tk.Frame(inner, bg=PANEL_BG)
         self.card_level_canvas = tk.Canvas(
-            inner, width=LEVEL_METER_W, height=6, bg=FIELD_BG,
+            self.card_level_row, width=LEVEL_METER_W, height=6, bg=FIELD_BG,
             highlightthickness=1, highlightbackground=BORDER,
         )
+        self.card_level_canvas.pack(side="left")
         self.card_level_bar = self.card_level_canvas.create_rectangle(0, 0, 0, 8, fill=PLAY_BG, width=0)
+        self._make_listen_button(self.card_level_row, 16, bg=PANEL_BG).pack(side="left", padx=(6, 0))
 
     def _add_background_card_checkbox(self, inner):
         """Extra content for the BACKGROUND card: the Enabled checkbox, right
@@ -522,14 +536,20 @@ class App:
 
     def _update_source_card(self):
         if self.input_mode == "audio":
-            self.card_level_canvas.pack(anchor="w", pady=(4, 0))
+            self.card_level_row.pack(anchor="w", pady=(4, 0))
         else:
-            self.card_level_canvas.pack_forget()
+            self.card_level_row.pack_forget()
         if self.input_mode == "audio":
             self.source_title_var.set("AUDIO INPUT")
+            # Cut to what fits on one line of the card (by width, not
+            # characters): a wrapped name would push the level meter and the
+            # listen button out of the fixed-height card.
             device = self.audio_device_var.get().strip() or "No device selected"
-            if len(device) > 26:
-                device = device[:25] + "…"
+            font = tkfont.Font(font=self.normal_font)
+            if font.measure(device) > CARD_TEXT_W:
+                while device and font.measure(device + "…") > CARD_TEXT_W:
+                    device = device[:-1]
+                device = device.rstrip() + "…"
             src = self._source_lang_code().upper()
             engine = "Azure" if self._engine_code() == "azure" else "Local"
             self.source_card_var.set(f"{device}\n{src} → {self._target_lang_code().upper()} · {engine}")
@@ -684,6 +704,7 @@ class App:
         self.level_bar = self.level_canvas.create_rectangle(0, 0, 0, LEVEL_METER_H + 2, fill=PLAY_BG, width=0)
         self.level_text_var = tk.StringVar(value="— dB")
         ttk.Label(ch_row, textvariable=self.level_text_var, foreground=MUTED_FG, width=8).pack(side="left")
+        self._make_listen_button(ch_row, 22).pack(side="left")
 
         lang_row = ttk.Frame(frame)
         lang_row.grid(row=2, column=1, columnspan=2, sticky="we", padx=4, pady=2)
@@ -889,18 +910,61 @@ class App:
             self._monitor = None
             self._append_log(f"Could not open '{self.audio_device_var.get()}' for the level meter: {e}")
             return
+        if self._listening:
+            try:
+                self._listen_out = audio_io.ListenOutput()
+                self._listen_out.start()
+            except Exception as e:
+                self._listen_out = None
+                self._set_listening(False)
+                self._append_log(f"Could not open the audio output to listen to the input: {e}")
+            else:
+                self._monitor.listener = self._listen_out
         self._monitor_gen += 1
         self._poll_monitor(self._monitor_gen)
 
     def _stop_monitor(self):
         monitor, self._monitor = getattr(self, "_monitor", None), None
+        listen_out, self._listen_out = getattr(self, "_listen_out", None), None
         if monitor is not None:
+            monitor.listener = None
             try:
                 monitor.close()
             except Exception:
                 pass
+        if listen_out is not None:
+            try:
+                listen_out.close()
+            except Exception:
+                pass
         if hasattr(self, "level_canvas"):
             self._update_level_meter(-120.0)
+
+    def _toggle_listen(self):
+        """Speaker button: plays the selected input (device/channel, or NDI
+        source audio) on the computer's default output, to hear what comes
+        in before Start. Only while stopped — Start turns it off."""
+        if self.worker and self.worker.is_alive():
+            self._append_log("Listening to the input is only available while stopped (before Start).")
+            return
+        turning_on = not self._listening
+        self._set_listening(turning_on)
+        self._restart_monitor()
+        if not turning_on:
+            self._append_log("Stopped listening to the input.")
+        elif self._listen_out is not None:
+            self._append_log(
+                f"Listening to the input on '{self._listen_out.name}'. "
+                "With a microphone, use headphones to avoid feedback."
+            )
+        elif self._listening:  # (if not, the output failed to open and said why)
+            self._set_listening(False)
+            self._append_log("Nothing to listen to: select an audio input first.")
+
+    def _set_listening(self, on):
+        self._listening = on
+        for btn in self._listen_btns:
+            btn.set_variant("on" if on else "off")
 
     def _poll_monitor(self, gen):
         # `gen` ends the polling chain of a monitor that has been replaced.
@@ -1372,13 +1436,15 @@ class App:
         `variants` is {name: (text, kind)} with kind from BUTTON_KINDS; all
         variants share the width of the widest one, so the button doesn't
         "jump" when its text changes (e.g. Start/Stop). Call `set_variant(name)`
-        afterwards to switch."""
+        afterwards to switch. A variant may carry a third item, an icon
+        function (w, h, rgba) -> RGBA image drawn over the button, in place
+        of or next to its text."""
         measure_font = tkfont.Font(family=self.font_family, size=10, weight="bold")
-        text_w = max(measure_font.measure(t) for t, _ in variants.values())
+        text_w = max(measure_font.measure(v[0]) for v in variants.values())
         w = max(text_w + 26, min_width)
 
         image_sets = {}
-        for name, (text, kind) in variants.items():
+        for name, (text, kind, *icon) in variants.items():
             fill_hex, fg, bold = BUTTON_KINDS[kind]
             if fill_hex is None:
                 idle_hex, hover_hex, press_hex, border_hex = BG, PANEL_BG, FIELD_BG, BORDER
@@ -1387,19 +1453,20 @@ class App:
                 hover_hex = App._shade(fill_hex, 1.15)
                 press_hex = App._shade(fill_hex, 0.75)
                 border_hex = App._shade(fill_hex, 0.7)
+
+            def image(fill_hex, border_hex=border_hex, fg=fg, icon=icon):
+                img = self._flat_rect(w, height, radius, self._hex_to_rgba(fill_hex), self._hex_to_rgba(border_hex))
+                if icon:
+                    img = Image.alpha_composite(img, icon[0](img.width, img.height, self._hex_to_rgba(fg)))
+                return ImageTk.PhotoImage(img)
+
             image_sets[name] = {
                 "text": text,
                 "fg": fg,
                 "font": self.bold_font if bold else self.normal_font,
-                "idle": ImageTk.PhotoImage(
-                    self._flat_rect(w, height, radius, self._hex_to_rgba(idle_hex), self._hex_to_rgba(border_hex))
-                ),
-                "hover": ImageTk.PhotoImage(
-                    self._flat_rect(w, height, radius, self._hex_to_rgba(hover_hex), self._hex_to_rgba(border_hex))
-                ),
-                "press": ImageTk.PhotoImage(
-                    self._flat_rect(w, height, radius, self._hex_to_rgba(press_hex), self._hex_to_rgba(border_hex))
-                ),
+                "idle": image(idle_hex),
+                "hover": image(hover_hex),
+                "press": image(press_hex),
             }
 
         btn = tk.Label(
@@ -1444,6 +1511,50 @@ class App:
 
         btn.set_variant = set_variant
         set_variant(initial)
+        return btn
+
+    @staticmethod
+    def _speaker_icon(waves):
+        """Icon function for _make_float_button: a loudspeaker with sound
+        waves (`waves`) or crossed out. Drawn rather than an emoji, which
+        Tk renders unreliably (especially on Windows)."""
+
+        def draw(w, h, rgba):
+            s = 4  # supersampling, for smooth edges once scaled down
+            img = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            u = min(w, h) * 0.065 * s
+            cx, cy = w * s / 2, h * s / 2
+            left = cx - 5 * u
+            d.polygon(
+                [(left, cy - 1.6 * u), (left + 2.4 * u, cy - 1.6 * u), (left + 5 * u, cy - 4.2 * u),
+                 (left + 5 * u, cy + 4.2 * u), (left + 2.4 * u, cy + 1.6 * u), (left, cy + 1.6 * u)],
+                fill=rgba,
+            )
+            stroke = max(s, int(0.9 * u))
+            if waves:
+                ax = left + 5 * u
+                for r in (2.4 * u, 4.6 * u):
+                    d.arc([ax - r, cy - r, ax + r, cy + r], start=-50, end=50, fill=rgba, width=stroke)
+            else:
+                x0, x1 = left + 6.6 * u, left + 9.8 * u
+                d.line([(x0, cy - 1.6 * u), (x1, cy + 1.6 * u)], fill=rgba, width=stroke)
+                d.line([(x0, cy + 1.6 * u), (x1, cy - 1.6 * u)], fill=rgba, width=stroke)
+            return img.resize((w, h), Image.LANCZOS)
+
+        return draw
+
+    def _make_listen_button(self, parent, height, bg=BG):
+        """Speaker toggle that plays the selected audio input on the
+        computer's default output (see _toggle_listen). Every copy (input
+        card, input panel) follows the same state."""
+        btn = self._make_float_button(
+            parent,
+            {"off": ("", "neutral", self._speaker_icon(False)), "on": ("", "accent", self._speaker_icon(True))},
+            "on" if self._listening else "off", command=self._toggle_listen, height=height, min_width=height + 8,
+        )
+        btn.config(bg=bg)
+        self._listen_btns.append(btn)
         return btn
 
     def _make_simple_button(self, parent, text, command, kind="neutral", height=26, min_width=0):
@@ -2153,6 +2264,7 @@ class App:
             target, args = self._run_pipeline, (self.sources[idx], output_name)
 
         self._stop_monitor()  # the engine opens its own capture of the device
+        self._set_listening(False)
         self.stop_event.clear()
         self.source_combo.config(state="disabled")
         self._set_input_settings_locked(True)
@@ -2372,6 +2484,8 @@ class App:
                 elif kind == "update_applied":
                     status, detail = payload
                     self._on_update_applied(status, detail)
+                elif kind == "requirements_installed":
+                    self._on_requirements_installed()
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
@@ -2518,7 +2632,80 @@ class App:
         except (OSError, subprocess.SubprocessError) as e:
             self.msg_queue.put(("update_applied", ("error", str(e))))
             return
-        self.msg_queue.put(("update_applied", ("ok", None)))
+        _installed, error = self._install_requirements()
+        self.msg_queue.put(("update_applied", ("ok", error)))
+
+    def _startup_requirements_worker(self):
+        """At startup, catches up on libraries an update brought without
+        installing them (e.g. pulled by an older version of the app, or by
+        hand with 'git pull')."""
+        installed, error = self._install_requirements()
+        if error:
+            self.msg_queue.put(("log", error))
+        elif installed and speech is None:
+            self.msg_queue.put(("requirements_installed", None))
+
+    def _on_requirements_installed(self):
+        if messagebox.askyesno(
+            f"{APP_NAME} - update",
+            "The libraries for the audio mode were installed. Restart now to use them?",
+        ):
+            self._restart_app()
+
+    @staticmethod
+    def _requirements_stamp_path():
+        # Kept in the Python environment itself (the .venv), so a new or
+        # recreated environment always gets the requirements installed.
+        return Path(sys.prefix) / "alphasubs_requirements.sha1"
+
+    def _install_requirements(self):
+        """After an update: installs requirements.txt into the running
+        Python environment when it changed since the last install here (or
+        was never installed by the app) — a pulled version may need new
+        libraries. Returns (installed, error message or None). Not for the
+        .exe, which bundles its libraries."""
+        if getattr(sys, "frozen", False):
+            return False, None
+        req = REPO_ROOT / "requirements.txt"
+        stamp = self._requirements_stamp_path()
+        try:
+            digest = hashlib.sha1(req.read_bytes()).hexdigest()
+            if stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == digest:
+                return False, None
+        except OSError as e:
+            return False, f"Could not read requirements.txt: {e}"
+        post = self.msg_queue.put
+        post(("log", "Installing the libraries this version needs (pip) — this can take several minutes..."))
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--progress-bar", "off",
+               "-r", str(req)]
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(REPO_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", creationflags=flags,
+            )
+            tail = []
+            for line in proc.stdout:
+                line = line.rstrip()
+                tail = (tail + [line])[-PIP_LOG_TAIL:]
+                if line.startswith(PIP_LOG_PREFIXES):
+                    post(("log", f"pip: {line}"))
+            proc.wait()
+        except OSError as e:
+            return False, f"Could not run pip: {e}"
+        if proc.returncode != 0:
+            for line in tail:
+                if not line.startswith(PIP_LOG_PREFIXES):  # those are in the Log already
+                    post(("log", f"pip: {line}"))
+            return False, (
+                "Installing the libraries failed (see Log). Run 'pip install -r requirements.txt' manually."
+            )
+        try:
+            stamp.write_text(digest, encoding="utf-8")
+        except OSError:
+            pass  # only means pip runs again next time
+        post(("log", "Libraries installed."))
+        return True, None
 
     def _on_update_applied(self, status, detail):
         if status == "error":
@@ -2530,6 +2717,9 @@ class App:
             )
             return
         self._append_log("Update applied.")
+        if detail:
+            self._append_log(detail)
+            messagebox.showwarning(f"{APP_NAME} - update", f"The update was applied, but:\n\n{detail}")
         if messagebox.askyesno(f"{APP_NAME} - update", "Update applied. Restart now to use the new version?"):
             self._restart_app()
         else:

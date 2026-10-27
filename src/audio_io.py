@@ -12,6 +12,8 @@ SAMPLE_RATE = 16000
 BLOCK_S = 0.05
 # NDI sources don't announce their audio channel count up front.
 NDI_MAX_CHANNELS = 8
+# Most audio the "listen" output may hold before dropping the oldest.
+LISTEN_MAX_DELAY_S = 0.3
 # WDM-KS devices on Windows are the same hardware already listed under
 # MME/DirectSound/WASAPI, and tend to fail to open in shared use.
 SKIPPED_HOSTAPIS = ("Windows WDM-KS",)
@@ -108,7 +110,8 @@ class AudioCapture:
     None to mix the first two channels (mono mics/stereo pairs both work).
     read() returns 16 kHz mono float32 blocks; `level_db` holds the latest
     input level (dBFS) for a meter. With `meter_only`, audio isn't kept at
-    all — only the level is updated (the pre-Start signal check)."""
+    all — only the level is updated (the pre-Start signal check). Setting
+    `listener` (a ListenOutput) also plays the input, meter_only or not."""
 
     def __init__(self, device_index, channel=None, meter_only=False):
         info = sd.query_devices(device_index)
@@ -120,6 +123,7 @@ class AudioCapture:
         n_open = channel + 1 if channel is not None else min(2, max_ch)
         self.native_rate = int(info["default_samplerate"])
         self.level_db = -120.0
+        self.listener = None
         self._q = queue.Queue(maxsize=400)
         self._resampler = _Resampler(self.native_rate)
         self._stream = sd.InputStream(
@@ -134,6 +138,9 @@ class AudioCapture:
         else:
             mono = indata[:, self.channel]
         self.level_db = _level_db(mono)
+        listener = self.listener
+        if listener is not None:
+            listener.feed(self.native_rate, mono)
         if self.meter_only:
             return
         try:
@@ -201,6 +208,7 @@ class NDIAudioCapture:
         self.channel = channel
         self.meter_only = meter_only
         self.level_db = -120.0
+        self.listener = None
         self._q = queue.Queue(maxsize=400)
         self._rate = None
         self._resampler = None
@@ -225,6 +233,9 @@ class NDIAudioCapture:
                 else:
                     mono = data[:2].mean(axis=0)
                 self.level_db = _level_db(mono)
+                listener = self.listener
+                if listener is not None:
+                    listener.feed(rate, mono)
                 if not self.meter_only:
                     try:
                         self._q.put_nowait((rate, mono))
@@ -248,3 +259,64 @@ class NDIAudioCapture:
         self._stop.set()
         self._thread.join(timeout=2.0)
         self._ndi.recv_destroy(self._recv)
+
+
+class ListenOutput:
+    """Plays a capture's audio on an output device (the system default if
+    `device_index` is None), so the operator can hear the input before
+    Start. Attach it as a capture's `listener`; feed() is called from the
+    capture thread with (rate, mono) blocks at the input's native rate."""
+
+    def __init__(self, device_index=None):
+        info = sd.query_devices(device_index, kind="output")
+        self.name = info["name"]
+        self.rate = int(info["default_samplerate"])
+        self._lock = threading.Lock()
+        self._chunks = []
+        self._len = 0
+        self._in_rate = None
+        self._resampler = None
+        # Input and output run on separate clocks: cap the backlog so a
+        # slightly faster input can't build up an ever-growing delay.
+        self._max_len = int(self.rate * LISTEN_MAX_DELAY_S)
+        self._stream = sd.OutputStream(
+            device=device_index, samplerate=self.rate, channels=min(2, int(info["max_output_channels"])),
+            dtype="float32", latency="low", callback=self._callback,
+        )
+
+    def start(self):
+        self._stream.start()
+
+    def feed(self, rate, mono):
+        if rate != self._in_rate:
+            self._in_rate, self._resampler = rate, _Resampler(rate, self.rate)
+        # Copy first: a sound device's callback buffer is reused, and the
+        # resampler returns its input as is when the rates match.
+        out = self._resampler.process(np.array(mono, dtype=np.float32, copy=True))
+        with self._lock:
+            self._chunks.append(out)
+            self._len += len(out)
+            while self._len > self._max_len and len(self._chunks) > 1:
+                self._len -= len(self._chunks.pop(0))
+
+    def _callback(self, outdata, frames, _time_info, _status):
+        block = np.zeros(frames, dtype=np.float32)
+        filled = 0
+        with self._lock:
+            while filled < frames and self._chunks:
+                chunk = self._chunks[0]
+                take = min(frames - filled, len(chunk))
+                block[filled:filled + take] = chunk[:take]
+                filled += take
+                if take == len(chunk):
+                    self._chunks.pop(0)
+                else:
+                    self._chunks[0] = chunk[take:]
+            self._len -= filled
+        outdata[:] = np.clip(block, -1.0, 1.0)[:, None]
+
+    def close(self):
+        try:
+            self._stream.stop()
+        finally:
+            self._stream.close()
