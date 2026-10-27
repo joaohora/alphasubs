@@ -233,6 +233,7 @@ class VoiceOutput:
         self._texts = queue.Queue()
         self._buffers = []
         self._stream = None
+        self.listener = None  # see set_listener
         self._stop = threading.Event()
         self._threads = [threading.Thread(target=self._synth_loop, daemon=True)]
         if self._sender is not None:
@@ -265,6 +266,12 @@ class VoiceOutput:
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
+
+    def set_listener(self, listener):
+        """Also plays each synthesized sentence on `listener` (an
+        audio_io.ListenOutput, unbounded), so the operator can hear the
+        voice; None stops. Callable from any thread."""
+        self.listener = listener
 
     def say(self, info):
         """Queues one final sentence: the `info` dict from the speech
@@ -337,6 +344,9 @@ class VoiceOutput:
                 continue
             for buf in self._buffers:
                 buf.append(_resample(pcm, synth.rate, buf.rate))
+            listener = self.listener
+            if listener is not None:
+                listener.feed(synth.rate, pcm * self._gain())
 
     def _gain(self):
         return 0.0 if self.tuning.muted else self.tuning.volume

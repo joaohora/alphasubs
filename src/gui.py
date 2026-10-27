@@ -204,6 +204,12 @@ class App:
         self._listening = False  # the monitor's audio also plays on the default output
         self._listen_out = None
         self._listen_btns = []
+        self._engine = None  # the running speech engine (audio mode), for listening
+        # Listening to the translated voice (VOICE card), while it runs.
+        self._voice_listening = False
+        self._voice_listen_out = None
+        self._voice_listen_btns = []
+        self._voice_out = None  # the running VoiceOutput
         # NDI (key mode) source from a preset / the last session, selected
         # once discovery finds it.
         self._wanted_ndi_source = self.audio_prefs.get("ndi_source_name") or None
@@ -457,12 +463,20 @@ class App:
         # captions, from the same recognized text), hence "+" not an arrow.
         self.voice_card_var = tk.StringVar(value="")
         tk.Label(row, text="+", bg=BG, fg=MUTED_FG, font=(self.font_family, 18, "bold")).pack(side="left", padx=4)
-        self._make_module_card(row, "VOICE", self.voice_card_var, self._open_voice_panel).pack(side="left")
+        self._make_module_card(
+            row, "VOICE", self.voice_card_var, self._open_voice_panel, extra=self._add_voice_card_listen,
+        ).pack(side="left")
+
+    def _add_voice_card_listen(self, inner):
+        """Extra content for the VOICE card: the listen (speaker) toggle, to
+        hear the translated voice on this computer while it runs."""
+        self.voice_listen_row = tk.Frame(inner, bg=PANEL_BG)
+        self._make_listen_button(self.voice_listen_row, 16, bg=PANEL_BG, voice=True).pack(side="left")
 
     def _add_source_card_meter(self, inner):
         """Extra content for the input card: a small input level meter and
         the listen (speaker) toggle, shown in the audio mode so the signal
-        can be checked at a glance — and heard — before Start."""
+        can be checked at a glance — and heard — before and after Start."""
         self.card_level_row = tk.Frame(inner, bg=PANEL_BG)
         self.card_level_canvas = tk.Canvas(
             self.card_level_row, width=LEVEL_METER_W, height=6, bg=FIELD_BG,
@@ -897,9 +911,12 @@ class App:
         """While the audio mode is selected and stopped, keeps a meter-only
         capture of the selected device/channel open, so the operator can
         check the signal before pressing Start. While running, the meter
-        follows the engine's own capture instead."""
+        follows the engine's own capture instead (and so does listening, see
+        _sync_engine_listen) — the monitor is left alone."""
+        if self.worker and self.worker.is_alive():
+            return
         self._stop_monitor()
-        if audio_io is None or self.input_mode != "audio" or (self.worker and self.worker.is_alive()):
+        if audio_io is None or self.input_mode != "audio":
             return
         if self._selected_audio_device()[0] is None:
             return
@@ -911,45 +928,67 @@ class App:
             self._append_log(f"Could not open '{self.audio_device_var.get()}' for the level meter: {e}")
             return
         if self._listening:
-            try:
-                self._listen_out = audio_io.ListenOutput()
-                self._listen_out.start()
-            except Exception as e:
-                self._listen_out = None
-                self._set_listening(False)
-                self._append_log(f"Could not open the audio output to listen to the input: {e}")
-            else:
-                self._monitor.listener = self._listen_out
+            self._listen_out = self._open_listen_output()
+            self._monitor.listener = self._listen_out
         self._monitor_gen += 1
         self._poll_monitor(self._monitor_gen)
 
     def _stop_monitor(self):
         monitor, self._monitor = getattr(self, "_monitor", None), None
-        listen_out, self._listen_out = getattr(self, "_listen_out", None), None
         if monitor is not None:
             monitor.listener = None
             try:
                 monitor.close()
             except Exception:
                 pass
-        if listen_out is not None:
-            try:
-                listen_out.close()
-            except Exception:
-                pass
+        self._close_listen_output()
         if hasattr(self, "level_canvas"):
             self._update_level_meter(-120.0)
+
+    def _open_listen_output(self):
+        try:
+            out = audio_io.ListenOutput()
+            out.start()
+            return out
+        except Exception as e:
+            self._set_listening(False)
+            self._append_log(f"Could not open the audio output to listen to the input: {e}")
+            return None
+
+    def _close_listen_output(self):
+        out, self._listen_out = getattr(self, "_listen_out", None), None
+        if out is not None:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+    def _sync_engine_listen(self):
+        """While running, listening taps the speech engine's own capture
+        (there is a single capture of the device then)."""
+        engine = self._engine
+        if engine is None:
+            return
+        if self._listening:
+            if self._listen_out is None:
+                self._listen_out = self._open_listen_output()
+            engine.set_listener(self._listen_out)
+        else:
+            engine.set_listener(None)
+            self._close_listen_output()
 
     def _toggle_listen(self):
         """Speaker button: plays the selected input (device/channel, or NDI
         source audio) on the computer's default output, to hear what comes
-        in before Start. Only while stopped — Start turns it off."""
-        if self.worker and self.worker.is_alive():
-            self._append_log("Listening to the input is only available while stopped (before Start).")
-            return
+        in — before Start (level monitor) and while running (the engine's
+        capture). It stays on across Start/Stop."""
+        running = bool(self.worker and self.worker.is_alive())
         turning_on = not self._listening
         self._set_listening(turning_on)
-        self._restart_monitor()
+        if running:
+            self._sync_engine_listen()
+        else:
+            self._restart_monitor()
         if not turning_on:
             self._append_log("Stopped listening to the input.")
         elif self._listen_out is not None:
@@ -957,9 +996,52 @@ class App:
                 f"Listening to the input on '{self._listen_out.name}'. "
                 "With a microphone, use headphones to avoid feedback."
             )
-        elif self._listening:  # (if not, the output failed to open and said why)
+        elif self._listening and not running:  # (if not listening, the output failed and said why)
             self._set_listening(False)
             self._append_log("Nothing to listen to: select an audio input first.")
+
+    def _toggle_voice_listen(self):
+        """VOICE card speaker: plays the translated voice on the computer's
+        default output while the pipeline runs (in addition to its own
+        device/NDI outputs). It stays on across Start/Stop."""
+        self._voice_listening = not self._voice_listening
+        for btn in self._voice_listen_btns:
+            btn.set_variant("on" if self._voice_listening else "off")
+        running = bool(self.worker and self.worker.is_alive())
+        self._sync_voice_listen()
+        if not self._voice_listening:
+            self._append_log("Stopped listening to the voice.")
+        elif self._voice_listen_out is not None:
+            self._append_log(f"Listening to the translated voice on '{self._voice_listen_out.name}'.")
+        elif running:
+            self._append_log("The voice isn't running — set it up (VOICE panel) and press Start again.")
+        else:
+            self._append_log("Listening to the voice: it will be heard here after Start.")
+
+    def _sync_voice_listen(self):
+        voice_out = self._voice_out
+        if voice_out is None:
+            return
+        if self._voice_listening:
+            if self._voice_listen_out is None:
+                try:
+                    self._voice_listen_out = audio_io.ListenOutput(max_delay_s=None)
+                    self._voice_listen_out.start()
+                except Exception as e:
+                    self._voice_listen_out = None
+                    self._append_log(f"Could not open the audio output to listen to the voice: {e}")
+            voice_out.set_listener(self._voice_listen_out)
+        else:
+            voice_out.set_listener(None)
+            self._close_voice_listen_output()
+
+    def _close_voice_listen_output(self):
+        out, self._voice_listen_out = self._voice_listen_out, None
+        if out is not None:
+            try:
+                out.close()
+            except Exception:
+                pass
 
     def _set_listening(self, on):
         self._listening = on
@@ -1124,6 +1206,10 @@ class App:
         self._update_voice_card()
 
     def _update_voice_card(self):
+        if self.input_mode == "audio" and self._voice_engine_code() != "off":
+            self.voice_listen_row.pack(anchor="w", pady=(4, 0))
+        else:
+            self.voice_listen_row.pack_forget()
         if self.input_mode != "audio":
             self.voice_card_var.set("Audio input mode only")
             return
@@ -1148,8 +1234,11 @@ class App:
             return None
         label = self.voice_device_var.get()
         device_index = next((idx for idx, lbl, _ch in self.output_devices if lbl == label), None)
-        if device_index is None and not self.voice_ndi_var.get():
-            self._append_log("Voice is on but has no output (device or NDI) — it won't be heard.")
+        if device_index is None and not self.voice_ndi_var.get() and not self._voice_listening:
+            self._append_log(
+                "Voice is on but has no output (device or NDI) — it won't be heard. "
+                "To only listen to it here, turn on the speaker on the VOICE card before Start."
+            )
             return None
         source = self._source_lang_code()
         return tts.VoiceSettings(
@@ -1544,17 +1633,20 @@ class App:
 
         return draw
 
-    def _make_listen_button(self, parent, height, bg=BG):
-        """Speaker toggle that plays the selected audio input on the
-        computer's default output (see _toggle_listen). Every copy (input
-        card, input panel) follows the same state."""
+    def _make_listen_button(self, parent, height, bg=BG, voice=False):
+        """Speaker toggle that plays, on the computer's default output, the
+        selected audio input (see _toggle_listen) or, with `voice`, the
+        translated voice (see _toggle_voice_listen). Every copy of a toggle
+        (e.g. input card and input panel) follows the same state."""
+        on = self._voice_listening if voice else self._listening
         btn = self._make_float_button(
             parent,
             {"off": ("", "neutral", self._speaker_icon(False)), "on": ("", "accent", self._speaker_icon(True))},
-            "on" if self._listening else "off", command=self._toggle_listen, height=height, min_width=height + 8,
+            "on" if on else "off", command=self._toggle_voice_listen if voice else self._toggle_listen,
+            height=height, min_width=height + 8,
         )
         btn.config(bg=bg)
-        self._listen_btns.append(btn)
+        (self._voice_listen_btns if voice else self._listen_btns).append(btn)
         return btn
 
     def _make_simple_button(self, parent, text, command, kind="neutral", height=26, min_width=0):
@@ -2264,7 +2356,6 @@ class App:
             target, args = self._run_pipeline, (self.sources[idx], output_name)
 
         self._stop_monitor()  # the engine opens its own capture of the device
-        self._set_listening(False)
         self.stop_event.clear()
         self.source_combo.config(state="disabled")
         self._set_input_settings_locked(True)
@@ -2368,6 +2459,8 @@ class App:
             except Exception as e:
                 post(("log", f"Voice output failed to start: {e}"))
                 voice_out = None
+            else:
+                post(("voice_started", voice_out))
 
         def on_caption(text, final, info=None):
             if final or self.caption_cfg.live:
@@ -2377,6 +2470,7 @@ class App:
 
         engine = speech.create_engine(settings, on_caption, log=lambda m: post(("log", m)), on_status=on_status)
         engine.start()
+        post(("engine_started", engine))
         post(("log", f"Captioning audio -> sending '{output_name}'."))
 
         last_key = None
@@ -2465,7 +2559,19 @@ class App:
                         self._update_source_card()
                 elif kind == "audio_level":
                     self._update_level_meter(payload)
+                elif kind == "voice_started":
+                    self._voice_out = payload
+                    self._sync_voice_listen()
+                elif kind == "engine_started":
+                    self._engine = payload
+                    self._sync_engine_listen()
                 elif kind == "stopped":
+                    # The engine has stopped (its capture is closed): listening
+                    # moves back to the level monitor, reopened below.
+                    self._engine = None
+                    self._close_listen_output()
+                    self._voice_out = None
+                    self._close_voice_listen_output()
                     self._set_running_visual(False)
                     self.source_combo.config(state="readonly")
                     self._set_input_settings_locked(False)
@@ -2476,8 +2582,7 @@ class App:
                         pending, self._pending_app_settings = self._pending_app_settings, None
                         self._apply_app_settings(pending)
                         self._append_log("Preset setup (input, recognition, voice, output name) applied.")
-                    else:
-                        self._restart_monitor()
+                    self._restart_monitor()
                 elif kind == "update_checked":
                     status, detail = payload
                     self._on_update_checked(status, detail)

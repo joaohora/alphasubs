@@ -126,6 +126,7 @@ class _Engine:
         self.on_status = on_status
         self.error = None
         self.capture = None
+        self.listener = None
         self.stop_event = threading.Event()
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
 
@@ -140,6 +141,15 @@ class _Engine:
         self.stop_event.set()
         self._thread.join(timeout=timeout)
 
+    def set_listener(self, listener):
+        """Also plays the captured audio on `listener` (an
+        audio_io.ListenOutput), or stops with None. Callable from any thread,
+        before or after the capture opens (that waits for the models)."""
+        self.listener = listener
+        capture = self.capture
+        if capture is not None:
+            capture.listener = listener
+
     def _open_capture(self):
         s = self.settings
         if s.ndi_source is not None:
@@ -148,6 +158,7 @@ class _Engine:
             raise RuntimeError("No audio input device selected.")
         else:
             self.capture = audio_io.AudioCapture(s.device_index, s.channel)
+        self.capture.listener = self.listener
         self.capture.start()
 
     def _thread_main(self):

@@ -265,9 +265,11 @@ class ListenOutput:
     """Plays a capture's audio on an output device (the system default if
     `device_index` is None), so the operator can hear the input before
     Start. Attach it as a capture's `listener`; feed() is called from the
-    capture thread with (rate, mono) blocks at the input's native rate."""
+    capture thread with (rate, mono) blocks at the input's native rate.
+    `max_delay_s` caps the backlog (None: keep everything, for audio fed in
+    whole sentences rather than in real time, like the translated voice)."""
 
-    def __init__(self, device_index=None):
+    def __init__(self, device_index=None, max_delay_s=LISTEN_MAX_DELAY_S):
         info = sd.query_devices(device_index, kind="output")
         self.name = info["name"]
         self.rate = int(info["default_samplerate"])
@@ -278,7 +280,7 @@ class ListenOutput:
         self._resampler = None
         # Input and output run on separate clocks: cap the backlog so a
         # slightly faster input can't build up an ever-growing delay.
-        self._max_len = int(self.rate * LISTEN_MAX_DELAY_S)
+        self._max_len = int(self.rate * max_delay_s) if max_delay_s is not None else None
         self._stream = sd.OutputStream(
             device=device_index, samplerate=self.rate, channels=min(2, int(info["max_output_channels"])),
             dtype="float32", latency="low", callback=self._callback,
@@ -296,7 +298,7 @@ class ListenOutput:
         with self._lock:
             self._chunks.append(out)
             self._len += len(out)
-            while self._len > self._max_len and len(self._chunks) > 1:
+            while self._max_len is not None and self._len > self._max_len and len(self._chunks) > 1:
                 self._len -= len(self._chunks.pop(0))
 
     def _callback(self, outdata, frames, _time_info, _status):
