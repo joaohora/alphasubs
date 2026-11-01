@@ -1,8 +1,9 @@
 """Live caption layout and rendering for the audio (speech-to-text) mode.
 
 CaptionBoard holds what the speech engine has said so far (finalized text +
-the in-progress partial) and lays it out as subtitle lines: roll-up in the
-live mode, pop-on pages of finished sentences otherwise.
+the in-progress partial) and lays it out as subtitle lines, in one of three
+modes (CaptionConfig.mode): pop-on pages of finished sentences, a box that
+fills word by word with confirmed text, or a live roll-up.
 render_keyed_captions() draws those lines as white-on-black, exactly like the
 caption signal the NDI mode receives, and runs them through the regular keyer
 (process_frame), so shadow/color/box follow the same TEXT/BACKGROUND
@@ -30,6 +31,19 @@ READING_CPS = 17.0
 PAGE_MIN_S = 1.5
 PAGE_MIN_FAST_S = 1.0
 CATCH_UP_FACTOR = 1.5
+# Box mode: confirmed text is written in word by word — at least
+# FLOW_WORDS_PER_S, faster when more is waiting (all of it within
+# FLOW_CATCH_UP_S). A trailing word without a space or punctuation after it
+# may still be growing ("deslig" + "uem"): it waits up to FLOW_WORD_WAIT_S.
+FLOW_WORDS_PER_S = 4.0
+FLOW_CATCH_UP_S = 1.5
+FLOW_WORD_WAIT_S = 0.8
+FLOW_KEEP_WORDS = 400
+SENTENCE_PUNCT = ".,!?;:…"
+
+MODE_SENTENCES = "sentences"
+MODE_BOX = "box"
+MODE_LIVE = "live"
 
 if sys.platform == "win32":
     _FONT_DIR = Path("C:/Windows/Fonts")
@@ -52,10 +66,11 @@ class CaptionConfig:
     bottom_margin: float = 80.0
     # Captions are cleared after this many seconds without new speech.
     hold_s: float = 4.0
-    # False: only finished sentences are shown, and never change once up.
-    # True: text also appears while the person speaks, and gets corrected
-    # as recognition improves (faster, but visibly rewrites itself).
-    live: bool = False
+    # MODE_SENTENCES: only finished sentences, never changing once up.
+    # MODE_BOX: confirmed text written in as it comes (never corrected); the
+    # box clears when full and goes on. MODE_LIVE: text appears while the
+    # person speaks and gets corrected as recognition improves.
+    mode: str = MODE_SENTENCES
 
 
 _font_cache = {}
@@ -102,13 +117,17 @@ class CaptionBoard:
     """Thread-safe store of the captions: the speech engine calls update()
     from its thread, the output loop calls visible_lines() from another.
 
-    Two layouts:
+    Three layouts:
     - roll-up (live mode): all recent text, the last `max_lines` lines of it,
       updating as the partial changes;
     - pop-on (finished sentences only): each sentence on its own, never
       mixed with the previous one; a sentence longer than `max_lines` is
       split into pages shown one after another, each up for a reading time
-      (shorter when more text is waiting, so it doesn't fall behind)."""
+      (shorter when more text is waiting, so it doesn't fall behind);
+    - box: text the engine has confirmed (stream(), or each final when the
+      engine doesn't stream) is written in word by word, filling the lines
+      from the top; when full it clears and goes on from the next word.
+      Nothing shown ever changes."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -119,6 +138,18 @@ class CaptionBoard:
         self._sentences = deque(maxlen=MAX_COMMITTED)
         self._pages = deque()  # pop-on: pages (line tuples) waiting
         self._page = None  # pop-on: (lines, shown_at, min_duration)
+        self._reset_box()
+
+    def _reset_box(self):
+        self._box_text = ""  # all confirmed text (trimmed to FLOW_KEEP_WORDS)
+        self._box_streamed = False  # the engine streams: ignore its finals
+        self._box_input = 0.0  # when text last came in
+        self._box_shown = 0  # words written in so far
+        self._box_page = 0  # word the current page starts at
+        self._box_credit = 0.0  # words owed to the reveal
+        self._box_idle = True  # nothing was waiting to be written in
+        self._box_tick = 0.0
+        self._box_revealed_at = 0.0
 
     def update(self, text, final):
         text = text.strip()
@@ -128,10 +159,30 @@ class CaptionBoard:
                     self._committed.append(text)
                     del self._committed[:-MAX_COMMITTED]
                     self._sentences.append(text)
+                    if not self._box_streamed:
+                        self._box_append(" " + text)
                 self._partial = ""
             else:
                 self._partial = text
             self._last_change = time.monotonic()
+
+    def stream(self, text):
+        """Confirmed text as the engine streams it (pieces, spacing
+        included: " Boa", " no", "ite,"), for the box mode."""
+        with self._lock:
+            self._box_streamed = True
+            self._box_append(text)
+
+    def _box_append(self, text):
+        self._box_text += text
+        self._box_input = time.monotonic()
+        words = self._box_text.split()
+        drop = min(self._box_page, len(words) - FLOW_KEEP_WORDS)
+        if drop > 0:  # forget pages long gone
+            tail = " " if self._box_text[-1:].isspace() else ""
+            self._box_text = " ".join(words[drop:]) + tail
+            self._box_page -= drop
+            self._box_shown -= drop
 
     def clear(self):
         with self._lock:
@@ -140,10 +191,13 @@ class CaptionBoard:
             self._sentences.clear()
             self._pages.clear()
             self._page = None
+            self._reset_box()
 
-    def visible_lines(self, font, max_width, max_lines, hold_s, pop_on=False):
-        if pop_on:
+    def visible_lines(self, font, max_width, max_lines, hold_s, mode=MODE_SENTENCES):
+        if mode == MODE_SENTENCES:
             return self._pop_on_lines(font, max_width, max(1, int(max_lines)), hold_s)
+        if mode == MODE_BOX:
+            return self._box_lines(font, max_width, max(1, int(max_lines)), hold_s)
         with self._lock:
             if time.monotonic() - self._last_change > hold_s:
                 self._committed.clear()
@@ -172,6 +226,47 @@ class CaptionBoard:
                 elif page is not None and now - page[1] >= page[2] + hold_s:
                     self._page = None
             return self._page[0] if self._page else ()
+
+    def _box_lines(self, font, max_width, max_lines, hold_s):
+        with self._lock:
+            now = time.monotonic()
+            text = self._box_text
+            words = text.split()
+            ready = len(words)
+            if words and not text[-1].isspace() and text[-1] not in SENTENCE_PUNCT \
+                    and now - self._box_input < FLOW_WORD_WAIT_S:
+                ready -= 1  # the last word may still grow
+            backlog = ready - self._box_shown
+            if backlog > 0:
+                if self._box_idle:
+                    self._box_credit = 1.0  # the first word goes up at once
+                    self._box_idle = False
+                else:
+                    rate = max(FLOW_WORDS_PER_S, backlog / FLOW_CATCH_UP_S)
+                    self._box_credit += (now - self._box_tick) * rate
+                step = min(backlog, int(self._box_credit))
+                if step:
+                    self._box_shown += step
+                    self._box_credit -= step
+                    self._box_revealed_at = now
+            else:
+                self._box_credit = 0.0
+                self._box_idle = True
+            self._box_tick = now
+            if self._box_shown >= ready and now - max(self._box_input, self._box_revealed_at) > hold_s:
+                self._box_page = self._box_shown  # silence: clear; go on on a fresh page
+                return ()
+            while True:
+                lines = wrap_lines(" ".join(words[self._box_page:self._box_shown]), font, max_width)
+                if len(lines) <= max_lines:
+                    break
+                # Full: a new page starts with the words that didn't fit.
+                self._box_page += sum(len(line.split()) for line in lines[:max_lines])
+            if not lines:
+                return ()
+            # Fill from the top line down (the renderer stacks lines up from
+            # the bottom margin, so pad with empty lines below).
+            return tuple(lines) + ("",) * (max_lines - len(lines))
 
 
 def _render_gray(lines, canvas_w, canvas_h, cap_cfg, font):

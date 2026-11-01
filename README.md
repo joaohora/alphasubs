@@ -176,11 +176,19 @@ line width, bottom margin, clear-after-silence time) instead of the keying
 controls. Shadow, text color, the background box and the OUTPUT settings
 work exactly as in the NDI mode, and so do presets.
 
-By default each finished sentence appears on its own, and never changes once
-it's up. A sentence longer than the number of lines is shown as consecutive
-pages, each up for a reading time (faster when more text is waiting). With
-**Show text while speaking**, text appears as the person talks instead
-(roll-up, faster, but it visibly corrects itself).
+**Display** (TEXT panel) chooses how captions appear:
+
+- *Finished sentences* (default): each sentence appears on its own, and
+  never changes once it's up. A sentence longer than the number of lines is
+  shown as consecutive pages, each up for a reading time (faster when more
+  text is waiting).
+- *Continuous box*: text is written in word by word as the engine confirms
+  it, filling the lines from the top; when the box is full it clears and
+  goes on. Nothing on screen is ever corrected. Most fluid with Soniox,
+  which confirms its translation in chunks every few seconds; with other
+  engines (or Claude translating) it writes in each finished sentence.
+- *Live roll-up*: text appears as the person talks (fastest, but it visibly
+  corrects itself).
 
 Expected latency is about 2–3 s from the end of a sentence to its caption
 with the local engine on a CPU, less with a GPU or with Azure.

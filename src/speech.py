@@ -3,7 +3,9 @@
 Each engine captures one audio input device, recognizes EN/PT/ES speech and
 reports caption text in the target language through
 on_caption(text, final, info): partial (still-changing) results as the
-speaker talks, then a final one per utterance. Finals carry `info` =
+speaker talks, then a final one per utterance. The cloud streaming engines
+also report confirmed text as it comes, as on_caption(piece, False,
+{"stream": True}). Finals carry `info` =
 {"lang": source language, "source": source-language text, "texts":
 {language: text}} so other consumers (the translated voice) can use a
 different language than the captions.
@@ -771,17 +773,83 @@ class AzureEngine(_Engine):
             flush_held(force=True)
 
 
+def _words(text):
+    """Words without punctuation or case, to compare texts."""
+    return re.sub(r"[^\w\s]", "", text).lower().split()
+
+
 def _join_translations(first, second):
     """Joins a held fragment's translation to the next utterance's — unless
     the service already retranslated the fragment as the start of the next
-    one ("Antes." + "Antes de começarmos, ...")."""
-    def words(pieces):
-        return re.sub(r"[^\w\s]", "", "".join(pieces)).lower().split()
-
-    head = words(first)
-    if head and words(second)[:len(head)] == head:
+    one ("Antes." + "Antes de começarmos, ..."), or it's a single word that
+    Soniox closed on its own before the rest ("Nós." + "Esperamos que...")."""
+    head = _words("".join(first))
+    if len(head) == 1 or (head and _words("".join(second))[:len(head)] == head):
         return list(second)
     return list(first) + [" "] + list(second)
+
+
+class _ConfirmedStream:
+    """Passes on a service's confirmed caption text as it comes (see
+    _CloudStreamEngine._stream), minus the debris Soniox leaves when it
+    closes a segment right after a sentence's first word or two: a
+    "sentence" of its own ("Antes.", "Nós."), then the real one — sometimes
+    retranslating the fragment ("Antes de começarmos, ..."), sometimes not
+    ("Esperamos que..."). So each sentence's first TINY_WORDS words wait for
+    the next one (no real delay: translations come in chunks); a sentence
+    that ends that short is held, and dropped if the next text repeats it or
+    — a single word — if more speech follows. Once the speaker stops, a held
+    sentence goes out after all (see release): it was a real "Obrigado."."""
+
+    TINY_WORDS = 2
+
+    def __init__(self, out):
+        self._out = out
+        self._start = []  # a sentence's first pieces, while it's still tiny
+        self._open = False  # the sentence is past TINY_WORDS: straight out
+        self._held = None  # a tiny sentence
+        self._after = ""  # text that came after it, until it can be compared
+
+    def caption(self, text):
+        if self._open:
+            self._emit(text)
+        else:
+            self._start.append(text)
+            start = "".join(self._start)
+            if len(start.split()) > self.TINY_WORDS:
+                self._start = []
+                self._emit(start)
+            elif start.rstrip().endswith(SENTENCE_END):
+                self._start = []
+                self.release()  # two tiny sentences in a row: the first was real
+                self._held = start
+                return
+            else:
+                return
+        # The next piece starts a new sentence after a sentence end.
+        self._open = not text.rstrip().endswith(SENTENCE_END)
+
+    def release(self):
+        """The speaker stopped: whatever is held was a real (short) sentence."""
+        if self._held is not None:
+            held, after = self._held, self._after
+            self._held, self._after = None, ""
+            self._out(held)
+            if after:
+                self._out(after)
+
+    def _emit(self, text):
+        if self._held is None:
+            self._out(text)
+            return
+        self._after += text
+        held = _words(self._held)
+        if len(_words(self._after)) < len(held) and not self._after.rstrip().endswith(SENTENCE_END):
+            return  # not enough yet to compare
+        if len(held) > 1 and _words(self._after)[:len(held)] != held:
+            self._out(self._held)
+        self._out(self._after)
+        self._held, self._after = None, ""
 
 
 class _Utterances:
@@ -868,6 +936,7 @@ class _CloudStreamEngine(_Engine):
         self._shown_partial = ""
         self._held = None  # a fragment waiting to be joined (see _emit)
         self._activity = 0.0  # when partial results last came in
+        self._confirmed = _ConfirmedStream(self._stream)
         self._fatal = None
         self._open_capture()
         connected_once = False
@@ -905,6 +974,8 @@ class _CloudStreamEngine(_Engine):
                         self._send_audio(ws, (np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
                     with self._lock:
                         self._emit(self._utterances.ready())
+                        if time.monotonic() - self._activity >= HOLD_IDLE_S:
+                            self._confirmed.release()
                 if self.stop_event.is_set():
                     self._finish(ws)
                     reader.join(timeout=3.0)
@@ -915,6 +986,7 @@ class _CloudStreamEngine(_Engine):
                 reader.join(timeout=1.0)
                 with self._lock:
                     self._emit(self._utterances.end() + self._utterances.ready(force=True), force=True)
+                    self._confirmed.release()
             if self._fatal:
                 raise RuntimeError(self._fatal)
             if not self.stop_event.is_set():
@@ -935,6 +1007,13 @@ class _CloudStreamEngine(_Engine):
             pass
         except Exception as e:
             self.log(f"{self.service}: unexpected message ({e}).")
+
+    def _stream(self, text):
+        """Caption-language text the service has confirmed (it won't
+        change), as it comes — for the box caption mode. With Claude
+        translating, this source-language text is dropped like partials."""
+        if text:
+            self.on_caption(text, False, {"stream": True})
 
     def _partial(self, text):
         if text:
@@ -1058,6 +1137,11 @@ class SonioxEngine(_CloudStreamEngine):
                 if final:
                     self._emit(u.end())
                 continue
+            # Confirmed caption-language text: translations, and speech
+            # already in the caption language ("none"; "original" tokens get
+            # translated).
+            if final and status != "original":
+                self._confirmed.caption(text)
             if status == "translation":
                 if final:
                     u.add_translation(text)
@@ -1133,6 +1217,8 @@ class SpeechmaticsEngine(_CloudStreamEngine):
             text = msg.get("metadata", {}).get("transcript", "")
             if text.strip():
                 u.add_source(" " + text, self.settings.source_lang, needs_translation=self.translating)
+                if not self.translating:
+                    self._stream(" " + text)  # Speechmatics doesn't make the tiny segments
                 # A sentence ends a caption: the short pauses between
                 # sentences in a fluent speech don't make an EndOfUtterance.
                 if text.rstrip().endswith(SENTENCE_END):
@@ -1146,6 +1232,7 @@ class SpeechmaticsEngine(_CloudStreamEngine):
             u.set_partial_translation("")
             if text.strip():
                 u.add_translation(" " + text)
+                self._stream(" " + text)
         elif kind == "AddPartialTranslation":
             text = " ".join(r.get("content", "") for r in msg.get("results", []))
             u.set_partial_translation(" " + text if text.strip() else "")

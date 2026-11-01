@@ -26,7 +26,9 @@ from PIL import Image, ImageDraw, ImageTk
 
 import languages
 import ndi_io
-from captions import CaptionBoard, CaptionConfig, load_font, render_keyed_captions
+from captions import (
+    MODE_BOX, MODE_LIVE, MODE_SENTENCES, CaptionBoard, CaptionConfig, load_font, render_keyed_captions,
+)
 from compositor import FPS_PRESETS, KeyerConfig, OutputConfig, place_on_canvas, process_frame
 
 try:
@@ -60,6 +62,21 @@ PRESET_COLOR_ATTRS = ("text_color_bgr", "shadow_color_bgr", "box_color_bgr", "ke
 KEY_MODE_LABELS = {"luma": "Black background (luma)", "color": "Custom color"}
 OUTPUT_ATTRS = ("canvas_w", "canvas_h", "fps_n", "fps_d", "scale", "pos_x_px", "pos_y_px")
 CAPTION_ATTRS = ("font_size", "max_lines", "line_width_pct", "bottom_margin", "hold_s")
+CAPTION_MODE_LABELS = {
+    MODE_SENTENCES: "Finished sentences",
+    MODE_BOX: "Continuous box (written in as confirmed, no corrections)",
+    MODE_LIVE: "Live roll-up (fastest, corrects itself on screen)",
+}
+
+
+def _caption_mode(saved, default):
+    """The caption mode in saved settings; older versions saved only
+    "caption_live" (True = the roll-up)."""
+    if saved.get("caption_mode") in CAPTION_MODE_LABELS:
+        return saved["caption_mode"]
+    if "caption_live" in saved:
+        return MODE_LIVE if saved["caption_live"] else MODE_SENTENCES
+    return default
 
 INPUT_MODE_LABELS = {"ndi": "NDI video (key)", "audio": "Audio (speech-to-text)"}
 # Language choices depend on the engine (see languages.py).
@@ -1471,12 +1488,19 @@ class App:
             frame, text="Bold", variable=self.caption_bold_var,
             command=lambda: setattr(self.caption_cfg, "bold", self.caption_bold_var.get()),
         ).grid(row=5, column=0, sticky="w", padx=4, pady=(2, 0))
-        self.caption_live_var = tk.BooleanVar(value=cap.live)
-        ttk.Checkbutton(
-            frame, text="Show text while speaking (faster, but it corrects itself on screen)",
-            variable=self.caption_live_var,
-            command=lambda: setattr(self.caption_cfg, "live", self.caption_live_var.get()),
-        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0))
+        ttk.Label(frame, text="Display:").grid(row=6, column=0, sticky="w", padx=4, pady=(4, 0))
+        self.caption_mode_var = tk.StringVar(value=CAPTION_MODE_LABELS.get(cap.mode, CAPTION_MODE_LABELS[MODE_SENTENCES]))
+        mode_combo = ttk.Combobox(
+            frame, textvariable=self.caption_mode_var, state="readonly",
+            values=list(CAPTION_MODE_LABELS.values()), width=46,
+        )
+        mode_combo.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        mode_combo.bind("<<ComboboxSelected>>", lambda e: self._on_caption_mode_change())
+
+    def _on_caption_mode_change(self):
+        self.caption_cfg.mode = next(
+            (k for k, v in CAPTION_MODE_LABELS.items() if v == self.caption_mode_var.get()), MODE_SENTENCES
+        )
 
     def _build_background_panel(self):
         win = self._make_panel_window("Background box")
@@ -2203,7 +2227,7 @@ class App:
             if attr in prefs:
                 setattr(cfg, attr, float(prefs[attr]))
         cfg.bold = bool(prefs.get("caption_bold", cfg.bold))
-        cfg.live = bool(prefs.get("caption_live", cfg.live))
+        cfg.mode = _caption_mode(prefs, cfg.mode)
         return cfg, prefs
 
     def _save_audio_defaults(self):
@@ -2216,7 +2240,8 @@ class App:
             data[f"{service}_key"] = getattr(self, f"{service}_key_var").get()
         data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         data["caption_bold"] = self.caption_cfg.bold
-        data["caption_live"] = self.caption_cfg.live
+        data["caption_mode"] = self.caption_cfg.mode
+        data["caption_live"] = self.caption_cfg.mode == MODE_LIVE  # for older versions
         self.presets["_audio"] = data
         self._save_presets_to_disk()
 
@@ -2332,7 +2357,8 @@ class App:
         self.presets[slot].update({attr: getattr(self.output_cfg, attr) for attr in OUTPUT_ATTRS})
         self.presets[slot].update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         self.presets[slot]["caption_bold"] = self.caption_cfg.bold
-        self.presets[slot]["caption_live"] = self.caption_cfg.live
+        self.presets[slot]["caption_mode"] = self.caption_cfg.mode
+        self.presets[slot]["caption_live"] = self.caption_cfg.mode == MODE_LIVE  # for older versions
         self.presets[slot]["_app"] = self._collect_app_settings()
         self._save_presets_to_disk()
         self._append_log(f"Preset {slot} saved (look + input, recognition, voice and output name).")
@@ -2348,9 +2374,8 @@ class App:
         if "caption_bold" in preset:
             self.caption_cfg.bold = bool(preset["caption_bold"])
             self.caption_bold_var.set(self.caption_cfg.bold)
-        if "caption_live" in preset:
-            self.caption_cfg.live = bool(preset["caption_live"])
-            self.caption_live_var.set(self.caption_cfg.live)
+        self.caption_cfg.mode = _caption_mode(preset, self.caption_cfg.mode)
+        self.caption_mode_var.set(CAPTION_MODE_LABELS[self.caption_cfg.mode])
         color_swatches = {
             "text_color_bgr": self.text_color_swatch,
             "shadow_color_bgr": self.color_swatch,
@@ -2593,7 +2618,10 @@ class App:
                 post(("voice_started", voice_out))
 
         def on_caption(text, final, info=None):
-            if final or self.caption_cfg.live:
+            if info and info.get("stream"):
+                board.stream(text)
+                return
+            if final or self.caption_cfg.mode == MODE_LIVE:
                 board.update(text, final)
             if final and info and info.get("source") and voice_out is not None:
                 voice_out.say(info)
@@ -2617,7 +2645,7 @@ class App:
                 w, h = int(out_cfg.canvas_w), int(out_cfg.canvas_h)
                 font = load_font(cap.font_size, cap.bold)
                 lines = board.visible_lines(
-                    font, w * cap.line_width_pct / 100.0, cap.max_lines, cap.hold_s, pop_on=not cap.live
+                    font, w * cap.line_width_pct / 100.0, cap.max_lines, cap.hold_s, mode=cap.mode
                 )
                 key = (lines, w, h, astuple(cap), astuple(self.live_cfg))
                 if key != last_key:
