@@ -83,21 +83,78 @@ MAX_LAG_S = 20.0
 CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
 
 
-def soniox_cloned_voices(key):
-    """{name: voice ID} of the voices cloned in the key's Soniox project
-    that are ready for the TTS model."""
+def _soniox_api(key, method, path, body=None, content_type=None):
+    """A call to the Soniox REST API (project key); the JSON reply, or None."""
     import json
+    import urllib.error
 
-    request = urllib.request.Request(
-        "https://api.soniox.com/v1/voices",
-        headers={"Authorization": f"Bearer {key.strip()}", "User-Agent": "AlphaSubs"},
-    )
-    with urllib.request.urlopen(request, timeout=15) as resp:
-        voices = json.loads(resp.read())["voices"]
-    return {
-        v["name"]: v["id"] for v in voices
-        if any(m.get("model") == SONIOX_TTS_MODEL and m.get("status") == "ready" for m in v.get("models", []))
-    }
+    headers = {"Authorization": f"Bearer {key.strip()}", "User-Agent": "AlphaSubs"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request("https://api.soniox.com" + path, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("message", "")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Soniox error {e.code}: {detail or e.reason}")
+    return json.loads(data) if data else None
+
+
+def _tts_status(voice):
+    """A cloned voice's state for the TTS model: processing / ready / failed
+    (with the reason)."""
+    for m in voice.get("models", []):
+        if m.get("model") == SONIOX_TTS_MODEL:
+            if m.get("status") == "failed":
+                return f"failed ({m.get('error_message') or m.get('error_type') or 'unknown'})"
+            return m.get("status", "processing")
+    return "processing"
+
+
+def soniox_voices(key):
+    """[(name, voice ID, status)] of the voices cloned in the key's Soniox
+    project; status as in _tts_status."""
+    voices = _soniox_api(key, "GET", "/v1/voices")["voices"]
+    return [(v["name"], v["id"], _tts_status(v)) for v in voices]
+
+
+def soniox_cloned_voices(key):
+    """{name: voice ID} of the cloned voices ready to speak."""
+    return {name: vid for name, vid, status in soniox_voices(key) if status == "ready"}
+
+
+def soniox_clone_voice(key, name, wav_path, timeout_s=120):
+    """Creates a cloned voice from a reference clip (one speaker, little
+    noise, up to 2 minutes) and waits until it can speak. Returns its ID."""
+    import uuid
+
+    boundary = uuid.uuid4().hex
+    data = Path(wav_path).read_bytes()
+    body = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="name"\r\n\r\n{name}\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{Path(wav_path).name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    voice = _soniox_api(key, "POST", "/v1/voices", body, f"multipart/form-data; boundary={boundary}")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status = _tts_status(voice)
+        if status == "ready":
+            return voice["id"]
+        if status.startswith("failed"):
+            raise RuntimeError(f"Soniox couldn't make the voice: {status}")
+        if time.monotonic() > deadline:
+            raise RuntimeError("Soniox is still processing the voice — check again later (Refresh).")
+        time.sleep(2.0)
+        voice = _soniox_api(key, "GET", f"/v1/voices/{voice['id']}")
+
+
+def soniox_delete_voice(key, voice_id):
+    _soniox_api(key, "DELETE", f"/v1/voices/{voice_id}")
 
 
 def voices_for(engine, lang):

@@ -242,11 +242,15 @@ stay in one language, and with Voice 1 in PT and Voice 2 in EN, each voice
 speaks only the other person's words. With cloned voices (below), each
 person can be heard in their own voice.
 
-**Cloned voices (Soniox):** voices created in the Soniox Console (Project →
-Voices → Create voice, from 10 s–2 min of clean speech by one person)
-appear in the *Speaker* list as "<name> (cloned)", in every language. Only
-clone someone with their written consent, and tell the audience the voice
-is synthetic.
+**Cloned voices (Soniox):** *Clone a voice (Soniox)...* in the VOICE panel
+records the person from the Input panel's audio device (or takes an audio
+file), and creates the voice in a few seconds — 30–60 s of one person
+speaking naturally, alone, with no music or room noise (the clone copies
+noise and echo too). The same window lists the project's cloned voices and
+deletes them (Soniox allows 20 per organization). Voices created in the
+Soniox Console (Project → Voices) work too. They appear in the *Speaker*
+list as "<name> (cloned)", in every language. Only clone someone with their
+written consent, and tell the audience the voice is synthetic.
 
 **Cloud meter** (main window, under Start): how long each cloud connection
 has been up in the current run ("Captions 12 min · Voice FR 12 min"; after

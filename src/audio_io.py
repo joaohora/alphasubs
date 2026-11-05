@@ -261,6 +261,33 @@ class NDIAudioCapture:
         self._ndi.recv_destroy(self._recv)
 
 
+class ClipRecorder:
+    """Records what a capture plays to its listener (mono, at the input's
+    own rate, up to `max_s`): attach it as a capture's `listener`. Used to
+    record a voice to clone."""
+
+    def __init__(self, max_s=120.0):
+        self.max_s = max_s
+        self.rate = None
+        self._chunks = []
+        self._len = 0
+
+    @property
+    def seconds(self):
+        return self._len / self.rate if self.rate else 0.0
+
+    def feed(self, rate, mono, lane=0):
+        if self.rate is None:
+            self.rate = rate
+        if rate != self.rate or self.seconds >= self.max_s:
+            return
+        self._chunks.append(np.array(mono, dtype=np.float32, copy=True))
+        self._len += len(mono)
+
+    def audio(self):
+        return np.concatenate(self._chunks) if self._chunks else np.zeros(0, np.float32)
+
+
 class _ListenLane:
     """One feeder's backlog in a ListenOutput."""
 

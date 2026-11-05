@@ -18,7 +18,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import astuple
 from pathlib import Path
-from tkinter import colorchooser, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
@@ -1322,6 +1322,9 @@ class App:
             self._add_slider(frame, 2, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
                              "buffer_ms", target=self.voice_tuning)
         frame.columnconfigure(0, minsize=VOICE_LABEL_W)
+        self._make_simple_button(frame, "Clone a voice (Soniox)...", self._open_clone_dialog).grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 2)
+        )
 
         for row, text in enumerate((
             "Speaks whole sentences, a few seconds behind the speaker; it speeds up (up to +35%)"
@@ -1332,7 +1335,7 @@ class App:
             " stream) — otherwise it gets translated again.",
             "Azure and Soniox voices use the keys from the Input panel.",
             "If the voice still breaks up, raise the audio buffer (it adds that much delay).",
-        ), start=3):
+        ), start=4):
             ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
                 row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0)
             )
@@ -1443,6 +1446,250 @@ class App:
         if current not in names and not (current.endswith(CLONED_SUFFIX) and not self._clones_loaded):
             slot.name_var.set(names[0] if names else "")
         self._update_voice_card()
+
+    def _open_clone_dialog(self):
+        """Creates a Soniox cloned voice from a recording of the audio input
+        (or a file), and lists/deletes the project's cloned voices."""
+        if tts is None:
+            return
+        if getattr(self, "_clone_win", None) is not None and self._clone_win.winfo_exists():
+            self._clone_win.deiconify()
+            self._clone_win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Clone a voice — Soniox")
+        win.configure(bg=BG)
+        self._darken_titlebar(win)
+        self._clone_win = win
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        frame.columnconfigure(1, weight=1)
+        state = {"recorder": None, "capture": None, "clip": None, "file": None, "busy": False}
+
+        ttk.Label(
+            frame, wraplength=560, justify="left", foreground=MUTED_FG,
+            text="30–60 s of one person speaking naturally, alone, with no music or room noise "
+                 "(up to 2 min). The clone copies everything it hears — noise, echo, clicks too.",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(frame, text="Name:").grid(row=1, column=0, sticky="w", pady=2)
+        name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=name_var, width=30).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        ttk.Label(frame, text="Audio:").grid(row=2, column=0, sticky="w", pady=2)
+        src_row = ttk.Frame(frame)
+        src_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+        source_var = tk.StringVar(value="Nothing recorded yet.")
+        record_btn = self._make_float_button(
+            src_row, {"idle": ("● Record", "neutral"), "recording": ("■ Stop", "negative")}, "idle",
+            command=lambda: toggle_record(), height=26,
+        )
+        record_btn.pack(side="left")
+        self._make_simple_button(src_row, "▶ Play", lambda: play()).pack(side="left", padx=6)
+        self._make_simple_button(src_row, "Choose file...", lambda: choose_file()).pack(side="left")
+        ttk.Label(frame, textvariable=source_var, foreground=MUTED_FG).grid(
+            row=3, column=1, columnspan=2, sticky="w", padx=4
+        )
+        ttk.Label(
+            frame, foreground=MUTED_FG,
+            text=f"Records from the Input panel's audio device ({self.audio_device_var.get() or 'none'}).",
+        ).grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
+
+        consent_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, variable=consent_var,
+            text="This person has given written consent to have their voice cloned.",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 2))
+
+        status_var = tk.StringVar(value="")
+        create_btn = self._make_simple_button(frame, "Create voice", lambda: create(), kind="accent")
+        create_btn.grid(row=6, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(frame, textvariable=status_var, foreground=MUTED_FG, wraplength=420).grid(
+            row=6, column=1, columnspan=2, sticky="w", padx=4
+        )
+
+        ttk.Separator(frame, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="we", pady=10)
+        ttk.Label(frame, text="Cloned voices in the project:").grid(row=8, column=0, columnspan=3, sticky="w")
+        listbox = tk.Listbox(
+            frame, height=6, bg=FIELD_BG, fg=FG, selectbackground=ACCENT, selectforeground=ACCENT_FG,
+            highlightthickness=1, highlightbackground=BORDER, relief="flat", activestyle="none",
+        )
+        listbox.grid(row=9, column=0, columnspan=2, sticky="we", pady=4)
+        self._make_simple_button(frame, "Delete", lambda: delete()).grid(row=9, column=2, sticky="nw", padx=4, pady=4)
+        voices = []  # (name, id, status), as listed
+
+        def key():
+            return self.soniox_key_var.get().strip()
+
+        def in_background(work, done):
+            def run():
+                try:
+                    result, error = work(), None
+                except Exception as e:
+                    result, error = None, str(e)
+                self.msg_queue.put(("call", lambda: done(result, error)))
+            threading.Thread(target=run, daemon=True).start()
+
+        def load_list():
+            if not key():
+                status_var.set("Needs the Soniox key (Input panel).")
+                return
+
+            def done(result, error):
+                if not win.winfo_exists():
+                    return
+                listbox.delete(0, "end")
+                voices[:] = result or []
+                for name, _vid, status in voices:
+                    listbox.insert("end", name if status == "ready" else f"{name} — {status}")
+                if error:
+                    status_var.set(f"Could not list the voices: {error}")
+            k = key()
+            in_background(lambda: tts.soniox_voices(k), done)
+
+        def stop_recording():
+            capture, state["capture"] = state["capture"], None
+            if capture is not None:
+                try:
+                    capture.close()
+                except Exception:
+                    pass
+            recorder = state["recorder"]
+            if recorder is not None and recorder.rate:
+                state["clip"] = (recorder.rate, recorder.audio())
+                state["file"] = None
+                source_var.set(f"Recorded {recorder.seconds:.0f} s.")
+            record_btn.set_variant("idle")
+
+        def tick():
+            recorder = state["recorder"]
+            if state["capture"] is None or recorder is None or not win.winfo_exists():
+                return
+            if recorder.seconds >= recorder.max_s:
+                stop_recording()
+                return
+            source_var.set(f"Recording... {recorder.seconds:.0f} s (stop at 30–60 s)")
+            win.after(250, tick)
+
+        def toggle_record():
+            if state["capture"] is not None:
+                stop_recording()
+                return
+            if self.worker and self.worker.is_alive():
+                status_var.set("Stop the pipeline first (the recording uses the audio input).")
+                return
+            try:
+                capture = self._open_audio_input(meter_only=True)
+                recorder = audio_io.ClipRecorder()
+                capture.listener = recorder
+                capture.start()
+            except Exception as e:
+                status_var.set(f"Could not open the audio input: {e}")
+                return
+            state["capture"], state["recorder"] = capture, recorder
+            record_btn.set_variant("recording")
+            tick()
+
+        def choose_file():
+            path = filedialog.askopenfilename(
+                parent=win, title="Reference audio",
+                filetypes=[("Audio", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac"), ("All files", "*.*")],
+            )
+            if path:
+                state["file"], state["clip"] = path, None
+                source_var.set(f"File: {Path(path).name}")
+
+        def play():
+            try:
+                import sounddevice as sd
+
+                if state["clip"] is not None:
+                    rate, clip = state["clip"]
+                    sd.play(clip, rate)
+                elif state["file"]:
+                    status_var.set("Play works for recordings only — open the file in another player.")
+            except Exception as e:
+                status_var.set(f"Could not play: {e}")
+
+        def create():
+            if state["busy"]:
+                return
+            stop_recording()
+            name = name_var.get().strip()
+            if not key():
+                status_var.set("Needs the Soniox key (Input panel).")
+                return
+            if not name:
+                status_var.set("Give the voice a name.")
+                return
+            if state["clip"] is None and not state["file"]:
+                status_var.set("Record the person or choose a file first.")
+                return
+            if not consent_var.get():
+                status_var.set("Confirm the person's written consent first.")
+                return
+            if state["clip"] is not None and len(state["clip"][1]) < state["clip"][0] * 10:
+                status_var.set("Record at least 10 s (30–60 s is best).")
+                return
+            state["busy"] = True
+            status_var.set("Uploading and creating the voice (a few seconds)...")
+            k = key()
+
+            def work():
+                path = state["file"]
+                if state["clip"] is not None:
+                    import tempfile
+                    import wave
+
+                    rate, clip = state["clip"]
+                    path = str(Path(tempfile.gettempdir()) / "alphasubs_voice_clip.wav")
+                    with wave.open(path, "wb") as w:
+                        w.setnchannels(1)
+                        w.setsampwidth(2)
+                        w.setframerate(rate)
+                        w.writeframes((np.clip(clip, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+                return tts.soniox_clone_voice(k, name, path)
+
+            def done(_voice_id, error):
+                state["busy"] = False
+                if not win.winfo_exists():
+                    return
+                if error:
+                    status_var.set(f"Not created: {error}")
+                    return
+                status_var.set(f"Voice '{name}' is ready — choose '{name}{CLONED_SUFFIX}' as the Speaker.")
+                self._append_log(f"Cloned voice '{name}' created on Soniox.")
+                load_list()
+                self._load_cloned_voices()
+            in_background(work, done)
+
+        def delete():
+            sel = listbox.curselection()
+            if not sel:
+                status_var.set("Select a voice in the list first.")
+                return
+            name, vid, _status = voices[sel[0]]
+            if not messagebox.askyesno(APP_NAME, f"Delete the cloned voice '{name}' from Soniox?", parent=win):
+                return
+
+            def done(_result, error):
+                if not win.winfo_exists():
+                    return
+                status_var.set(f"Could not delete: {error}" if error else f"Voice '{name}' deleted.")
+                if not error:
+                    self._append_log(f"Cloned voice '{name}' deleted on Soniox.")
+                load_list()
+                self._load_cloned_voices()
+            k = key()
+            in_background(lambda: tts.soniox_delete_voice(k, vid), done)
+
+        def close():
+            stop_recording()
+            win.destroy()
+            self._clone_win = None
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        load_list()
 
     def _voice_id(self, slot):
         """The speaker to synthesize with: a cloned voice's ID, or the name."""
@@ -3028,6 +3275,8 @@ class App:
                 elif kind == "engine_started":
                     self._engine = payload
                     self._sync_engine_listen()
+                elif kind == "call":  # a background task's result, handled here on the UI thread
+                    payload()
                 elif kind == "cloned_voices":
                     self._cloned_voices, self._clones_loaded = payload, True
                     for slot in self.voice_slots:
