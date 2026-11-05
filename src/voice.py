@@ -83,13 +83,13 @@ SPEEDUP_PER_S = 0.06
 SPEEDUP_MAX = 1.35
 MAX_LAG_S = 20.0
 CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
-# Ducking: the original drops to the chosen level within ~DUCK_ATTACK_S of a
-# voice starting and comes back over ~DUCK_RELEASE_S once it has been silent
-# for DUCK_HOLD_S (the pauses between sentences and synthesis chunks don't
-# make it pump). The original is live audio on another clock: it's played
-# with ORIGINAL_PREFILL_S of slack and trimmed past ORIGINAL_MAX_S of backlog.
-DUCK_ATTACK_S = 0.04
-DUCK_RELEASE_S = 0.35
+# Ducking (see DuckTuning): the original comes back up only once the voice
+# has been silent for DUCK_HOLD_S, so the pauses between sentences and
+# synthesis chunks don't make it pump. The original is live audio on another
+# clock: it's played with ORIGINAL_PREFILL_S of slack and trimmed past
+# ORIGINAL_MAX_S of backlog.
+DUCK_ATTACK_MS_DEFAULT = 50
+DUCK_RELEASE_MS_DEFAULT = 1000
 DUCK_HOLD_S = 0.6
 ORIGINAL_PREFILL_S = 0.08
 ORIGINAL_MAX_S = 0.35
@@ -211,6 +211,17 @@ class VoiceTuning:
     # The app's Mute: silences the voice at once (mid-sentence too), and
     # sentences spoken meanwhile are dropped rather than played later.
     muted: bool = False
+
+
+@dataclass
+class DuckTuning:
+    """The original under the voices, bound to GUI controls; all apply live.
+    `level_db`: its level while a voice speaks (None: not played — the
+    voices only). `attack_ms` / `release_ms`: how long it takes to go down
+    when a voice starts / to come back up after it (to ~95%)."""
+    level_db: float = None
+    attack_ms: float = DUCK_ATTACK_MS_DEFAULT
+    release_ms: float = DUCK_RELEASE_MS_DEFAULT
 
 
 def _approach(start, target, n, tau):
@@ -503,9 +514,10 @@ class _Route:
     def channels(self):
         return self._channels() if callable(self._channels) else self._channels
 
-    def duck(self, filled, n, rate, level):
+    def duck(self, filled, n, rate, level, attack_s, release_s):
         """The original's gain for the next n samples, the voice having
-        played the first `filled` of them."""
+        played the first `filled` of them. A glide covers ~95% in 3 time
+        constants, hence the /3."""
         if filled:
             self.hold = int(rate * DUCK_HOLD_S)
             down = n
@@ -514,10 +526,10 @@ class _Route:
         self.hold = max(0, self.hold - (n - filled))
         parts = []
         if down:
-            parts.append(_approach(self.env, level, down, rate * DUCK_ATTACK_S))
+            parts.append(_approach(self.env, level, down, max(1.0, rate * attack_s / 3)))
             self.env = float(parts[-1][-1])
         if n - down:
-            parts.append(_approach(self.env, 1.0, n - down, rate * DUCK_RELEASE_S))
+            parts.append(_approach(self.env, 1.0, n - down, max(1.0, rate * release_s / 3)))
             self.env = float(parts[-1][-1])
         return np.concatenate(parts).astype(np.float32)
 
@@ -525,16 +537,16 @@ class _Route:
 class _Mix:
     """One audio output (a sound device or an NDI source), shared by the
     voices routed to it: each voice has its own buffer, played on its own
-    channels, so two voices don't queue behind each other. With
-    `original_gain` set (a function returning the original's level under
-    the voice, or None for none), the original plays on the voices'
-    channels too, lowered while the voice on that channel speaks."""
+    channels, so two voices don't queue behind each other. With `ducking`
+    set (a function returning (the original's gain under the voice, attack
+    s, release s), or None for no original), the original plays on the
+    voices' channels too, lowered while the voice on that channel speaks."""
 
     def __init__(self, rate, channels):
         self.rate = rate
         self.channels = channels
         self.original = _LiveBuffer(rate)
-        self.original_gain = lambda: None
+        self.ducking = lambda: None
         self._routes = []
         self._resampler = None
 
@@ -546,7 +558,7 @@ class _Mix:
     def feed_original(self, rate, mono):
         """Called from the input's thread (a sound device callback: keep it
         light — numpy only)."""
-        if self.original_gain() is None:
+        if self.ducking() is None:
             if self.original.seconds():
                 self.original.clear()
             return
@@ -559,7 +571,7 @@ class _Mix:
     def read(self, n):
         """(channels, n) float32."""
         out = np.zeros((self.channels, n), dtype=np.float32)
-        level = self.original_gain()
+        ducking = self.ducking()
         envs = {}  # channel -> the original's gain there (the most ducked voice wins)
         for r in self._routes:
             if not r.buf.active:
@@ -569,11 +581,11 @@ class _Mix:
             channels = [c for c in r.channels if c < self.channels]
             for c in channels:
                 out[c] += block * gain
-            if level is not None:
-                env = r.duck(filled if gain > 0 else 0, n, self.rate, level)
+            if ducking is not None:
+                env = r.duck(filled if gain > 0 else 0, n, self.rate, *ducking)
                 for c in channels:
                     envs[c] = np.minimum(envs[c], env) if c in envs else env
-        if level is not None and envs:
+        if ducking is not None and envs:
             original = self.original.read(n)
             for c, env in envs.items():
                 out[c] += original * env
@@ -779,11 +791,11 @@ class VoiceOutput:
     device or on the NDI output's audio share it, each on its own channels.
     The buffer size is the first voice's."""
 
-    def __init__(self, voices, ndi_sender, make_sender, log, duck_db=None):
+    def __init__(self, voices, ndi_sender, make_sender, log, duck=None):
         """`voices`: [(VoiceSettings, VoiceTuning)]. `ndi_sender`: the NDI
         output (for voices with ndi_channels). `make_sender(name)`: creates
         an NDI sender, for voices with an ndi_source of their own.
-        `duck_db`: see the attribute."""
+        `duck`: a DuckTuning, for the original under the voices (read live)."""
         self.log = log
         self._voices = [_Voice(s, t, log) for s, t in voices]
         self._buffer_s = max(0.02, voices[0][1].buffer_ms / 1000.0)
@@ -793,14 +805,13 @@ class VoiceOutput:
         self._monitor_mix = None
         self._monitor_out = None
         self._monitored = set()
-        # The original's level (dB) under a speaking voice, on the voices'
-        # channels (None: the voices only). Settable live.
-        self.duck_db = duck_db
+        self._duck = duck or DuckTuning()
 
-    def _original_gain(self):
-        if self.duck_db is None or all(v.tuning.muted for v in self._voices):
+    def _ducking(self):
+        d = self._duck
+        if d.level_db is None or all(v.tuning.muted for v in self._voices):
             return None
-        return 10.0 ** (self.duck_db / 20.0)
+        return 10.0 ** (d.level_db / 20.0), d.attack_ms / 1000.0, d.release_ms / 1000.0
 
     def start(self):
         try:
@@ -811,7 +822,7 @@ class VoiceOutput:
             self._close_outputs()
             raise
         for out in self._outputs:
-            out.mix.original_gain = self._original_gain
+            out.mix.ducking = self._ducking
         self._prepare_monitor()
         for v in self._voices:
             v.start()
@@ -827,7 +838,7 @@ class VoiceOutput:
         except Exception as e:
             self.log(f"No default audio output to monitor the voices: {e}")
             return
-        mix.original_gain = self._original_gain
+        mix.ducking = self._ducking
         for v in self._voices:
             v.monitor = mix.route(lambda v=v: self._monitor_channels(v), v._gain)
             v.monitor.active = False

@@ -236,9 +236,13 @@ already heard the original.
 **Original under the voices (ducking):** *Original under voices* plays the
 input's sound on the voices' channels too — at full level between
 sentences, and lowered to the chosen level (−6 to −30 dB) while the voice
-speaks, coming back smoothly about half a second after it stops. The
-listeners always hear the speaker underneath the translation. *Off*: the
-voices only. It can be changed while running; Mute silences it too.
+speaks, coming back once the voice has been silent for 0.6 s. *Attack*
+(default 50 ms) is how fast it goes down when the voice starts, *Release*
+(default 1000 ms) how fast it comes back. The listeners always hear the
+speaker underneath the translation. *Off*: the voices only. All of it can be
+changed while running; Mute silences it too.
+
+The VOICE panel scrolls when it doesn't fit on the screen.
 
 **Monitoring:** the VOICE card has a speaker per voice (numbered 1 and 2
 when both are on), playing on this computer's default output what that

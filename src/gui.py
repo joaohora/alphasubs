@@ -107,7 +107,7 @@ APP_SETTING_KEYS = (
     *(f"{prefix}{name}" for prefix in ("voice_", "voice2_") for name in (
         "engine", "name", "lang", "device_label", "device_channels", "ndi_route", "ndi", "speed", "volume",
     )),
-    "voice_buffer_ms", "voice_duck",
+    "voice_buffer_ms", "voice_duck", "voice_duck_attack_ms", "voice_duck_release_ms",
 )
 VOICE_ENGINE_LABELS = {
     "off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)", "soniox": "Cloud (Soniox)",
@@ -300,6 +300,14 @@ class App:
         self._voice_out = None  # the running VoiceOutput
         duck = str(self.audio_prefs.get("voice_duck", "off"))
         self.voice_duck_var = tk.StringVar(value=DUCK_LABELS.get(duck, DUCK_LABELS["off"]))
+        self.duck_tuning = (
+            tts.DuckTuning(
+                level_db=None if duck not in DUCK_LABELS or duck == "off" else float(duck),
+                attack_ms=float(self.audio_prefs.get("voice_duck_attack_ms", tts.DUCK_ATTACK_MS_DEFAULT)),
+                release_ms=float(self.audio_prefs.get("voice_duck_release_ms", tts.DUCK_RELEASE_MS_DEFAULT)),
+            )
+            if tts else None
+        )
         # Cloud connections of the current (or last) run: [(label, seconds)],
         # and the Soniox account: (spent today, balance or None, note).
         self._connections = []
@@ -745,6 +753,41 @@ class App:
         self._darken_titlebar(win)
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         return win
+
+    def _make_scroll_area(self, win):
+        """A vertically scrolling area filling `win`; returns the frame to
+        build into. The window takes the content's height up to what fits
+        on the screen (scrolling beyond), and follows it when the content
+        grows or shrinks (e.g. a voice turned on or off)."""
+        canvas = tk.Canvas(win, bg=BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        max_h = max(300, self.root.winfo_screenheight() - 140)
+
+        def on_content_configure(_event):
+            canvas.configure(
+                scrollregion=canvas.bbox("all"),
+                width=content.winfo_reqwidth(), height=min(content.winfo_reqheight(), max_h),
+            )
+
+        content.bind("<Configure>", on_content_configure)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
+
+        def on_mousewheel(event):
+            if content.winfo_reqheight() <= canvas.winfo_height():
+                return
+            steps = -event.delta if sys.platform == "darwin" else -event.delta // 120
+            canvas.yview_scroll(int(steps), "units")
+
+        # While the pointer is over the panel (the main window binds the
+        # wheel the same way for its own content).
+        win.bind("<Enter>", lambda e: win.bind_all("<MouseWheel>", on_mousewheel))
+        win.bind("<Leave>", lambda e: win.unbind_all("<MouseWheel>"))
+        return content
 
     def _open_source_panel(self):
         self.source_panel.deiconify()
@@ -1263,13 +1306,10 @@ class App:
     def _duck_code(self):
         return next((k for k, v in DUCK_LABELS.items() if v == self.voice_duck_var.get()), "off")
 
-    def _duck_db(self):
-        code = self._duck_code()
-        return None if code == "off" else float(code)
-
     def _on_duck_change(self):
-        if self._voice_out is not None:
-            self._voice_out.duck_db = self._duck_db()  # applies live
+        code = self._duck_code()
+        if self.duck_tuning is not None:
+            self.duck_tuning.level_db = None if code == "off" else float(code)  # applies live
         self._update_voice_card()
 
     def _set_listening(self, on):
@@ -1340,7 +1380,7 @@ class App:
         win = self._make_panel_window("Voice — translated speech")
         self.voice_panel = win
 
-        frame = ttk.Frame(win)
+        frame = ttk.Frame(self._make_scroll_area(win))
         frame.pack(fill="both", expand=True, padx=10, pady=10)
         frame.columnconfigure(1, weight=1)
 
@@ -1349,12 +1389,29 @@ class App:
             box.grid(row=slot.index, column=0, columnspan=3, sticky="we", pady=(0, 8))
             self._build_voice_slot(box, slot)
 
-        ttk.Label(frame, text="Original under voices:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
-        duck_combo = ttk.Combobox(
-            frame, textvariable=self.voice_duck_var, state="readonly", values=list(DUCK_LABELS.values()), width=28,
-        )
-        duck_combo.bind("<<ComboboxSelected>>", lambda e: self._on_duck_change())
-        duck_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        if self.duck_tuning is not None:
+            box = ttk.LabelFrame(frame, text=" ORIGINAL UNDER THE VOICES (DUCKING) ", padding=(8, 4))
+            box.grid(row=2, column=0, columnspan=3, sticky="we", pady=(0, 8))
+            box.columnconfigure(0, minsize=VOICE_LABEL_W - 8)
+            box.columnconfigure(1, weight=1)
+            ttk.Label(box, text="Original level:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+            duck_combo = ttk.Combobox(
+                box, textvariable=self.voice_duck_var, state="readonly", values=list(DUCK_LABELS.values()), width=28,
+            )
+            duck_combo.bind("<<ComboboxSelected>>", lambda e: self._on_duck_change())
+            duck_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+            self._add_slider(box, 1, "Attack (ms)", 5, 500, self.duck_tuning.attack_ms, "attack_ms",
+                             target=self.duck_tuning, key="duck_attack_ms")
+            self._add_slider(box, 2, "Release (ms)", 100, 3000, self.duck_tuning.release_ms, "release_ms",
+                             target=self.duck_tuning, key="duck_release_ms")
+            ttk.Label(
+                box, foreground=MUTED_FG, wraplength=480, justify="left",
+                text="The input's sound also plays on the voices' channels: at full level between sentences,"
+                " lowered to this level while the voice speaks. Attack: how fast it goes down when the"
+                f" voice starts; release: how fast it comes back, {tts.DUCK_HOLD_S:g} s after the voice"
+                f" stops. Defaults {tts.DUCK_ATTACK_MS_DEFAULT} / {tts.DUCK_RELEASE_MS_DEFAULT} ms."
+                " All adjustable while running.",
+            ).grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0))
         if self.voice_tuning is not None:
             self._add_slider(frame, 3, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
                              "buffer_ms", target=self.voice_tuning)
@@ -1368,8 +1425,6 @@ class App:
             " as it falls behind, and skips sentences only past 20 s of delay.",
             "Two voices (two languages) on the same device or NDI output: give each its own"
             " channels (e.g. 1 and 2, or 1+2 and 3+4).",
-            "Original under voices: the input's sound also plays on the voices' channels, at full"
-            " level between sentences and lowered while the voice speaks (adjustable while running).",
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
             "Azure and Soniox voices use the keys from the Input panel.",
@@ -2788,6 +2843,9 @@ class App:
         if self.voice_tuning is not None:
             values["voice_buffer_ms"] = self.voice_tuning.buffer_ms
         values["voice_duck"] = self._duck_code()
+        if self.duck_tuning is not None:
+            values["voice_duck_attack_ms"] = self.duck_tuning.attack_ms
+            values["voice_duck_release_ms"] = self.duck_tuning.release_ms
         return {key: values[key] for key in APP_SETTING_KEYS if key in values}
 
     def _apply_app_settings(self, values):
@@ -2869,6 +2927,10 @@ class App:
             self.sliders["buffer_ms"].set(float(values["voice_buffer_ms"]))
         if str(values.get("voice_duck")) in DUCK_LABELS:
             self.voice_duck_var.set(DUCK_LABELS[str(values["voice_duck"])])
+            self._on_duck_change()
+        for name in ("attack_ms", "release_ms"):
+            if f"voice_duck_{name}" in values and f"duck_{name}" in self.sliders:
+                self.sliders[f"duck_{name}"].set(float(values[f"voice_duck_{name}"]))
 
     def _current_ndi_source_name(self):
         idx = self.source_combo.current()
@@ -3045,7 +3107,7 @@ class App:
                 v.lang for v, _tuning in voices if v.lang != settings.target_lang
             ))
             settings.extra_sessions = tuple(dict.fromkeys(v.lang for v, _tuning in voices if v.own_stream))
-            target, args = self._run_audio_pipeline, (settings, voices, output_name, self._duck_db())
+            target, args = self._run_audio_pipeline, (settings, voices, output_name)
         else:
             idx = self.source_combo.current()
             if idx < 0 or idx >= len(self.sources):
@@ -3130,15 +3192,15 @@ class App:
             self.msg_queue.put(("log", "Stopped."))
             self.msg_queue.put(("stopped", None))
 
-    def _run_audio_pipeline(self, settings, voices, output_name, duck_db):
+    def _run_audio_pipeline(self, settings, voices, output_name):
         """Audio mode: the speech engine (own thread) feeds a CaptionBoard;
         this loop renders the visible caption lines, runs them through the
         same keyer/shadow/box and output placement as the NDI mode, and
         sends a frame per output frame period. Captions are only re-rendered
         when the text or a setting changes. If a voice is configured, each
         final sentence is also spoken, by each of the `voices` (VoiceOutput
-        runs its own threads), with the original under them at `duck_db`
-        (None: not)."""
+        runs its own threads), with the original under them as set in
+        self.duck_tuning (read live)."""
         post = self.msg_queue.put
         try:
             # Paced by this loop, not by the SDK (see ndi_io.Sender).
@@ -3159,7 +3221,7 @@ class App:
         if voices:
             voice_out = tts.VoiceOutput(
                 voices, sender, lambda name: ndi_io.Sender(name, clock_video=False), log=lambda m: post(("log", m)),
-                duck_db=duck_db,
+                duck=self.duck_tuning,
             )
             try:
                 voice_out.start()
