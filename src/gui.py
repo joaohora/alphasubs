@@ -95,6 +95,7 @@ NDI_INPUT_PREFIX = "NDI: "
 LEVEL_METER_W, LEVEL_METER_H = 140, 10
 CARD_TEXT_W = 175  # a module card's text width (its labels wrap at 180 px)
 LEVEL_INTERVAL_S = 0.1
+SONIOX_ACCOUNT_INTERVAL_S = 120  # how often the Soniox spending is re-read while running
 # The app's configuration beyond the look — input, recognition, voice and the
 # output name. Saved in each preset (under "_app") and, together with the
 # API keys (app-wide, never in presets), as the last session.
@@ -102,13 +103,59 @@ APP_SETTING_KEYS = (
     "input_mode", "ndi_source_name", "output_name",
     "device_label", "channel", "source_lang", "target_lang", "engine", "whisper_model", "hotwords",
     "translation", "claude_model",
-    "voice_engine", "voice_name", "voice_lang", "voice_device_label", "voice_ndi",
-    "voice_speed", "voice_volume", "voice_buffer_ms",
+    *(f"{prefix}{name}" for prefix in ("voice_", "voice2_") for name in (
+        "engine", "name", "lang", "device_label", "device_channels", "ndi_route", "ndi", "speed", "volume",
+    )),
+    "voice_buffer_ms",
 )
 VOICE_ENGINE_LABELS = {
     "off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)", "soniox": "Cloud (Soniox)",
 }
 NO_DEVICE_LABEL = "None"
+VOICE_LABEL_W = 150  # the VOICE panel's label column (px)
+# Where a voice goes in NDI: channels of the NDI output's audio (next to the
+# captions' video; the output gets as many channels as the highest one
+# used), or an audio-only NDI source of its own.
+NDI_ROUTE_LABELS = {
+    "off": "Not sent",
+    "1+2": "Output audio, channels 1+2",
+    "1": "Output audio, channel 1 (left)",
+    "2": "Output audio, channel 2 (right)",
+    "3+4": "Output audio, channels 3+4",
+    "3": "Output audio, channel 3",
+    "4": "Output audio, channel 4",
+    "own": "Own NDI source (audio only)",
+}
+
+
+def _channels_of(code):
+    """"1+2" -> (0, 1): channel codes (1-based, as shown) to indices."""
+    return tuple(int(c) - 1 for c in code.split("+"))
+
+
+def _channel_codes(count):
+    """A sound device's channel choices: each pair, then its two channels."""
+    codes = []
+    for first in range(1, count + 1, 2):
+        if first + 1 <= count:
+            codes.append(f"{first}+{first + 1}")
+        codes += [str(c) for c in range(first, min(first + 1, count) + 1)]
+    return codes
+
+
+class _VoiceSlot:
+    """One translated voice's controls in the VOICE panel (its widgets are
+    added by App._build_voice_slot). Voice 1 keeps the settings keys older
+    versions used ("voice_..."), voice 2 has its own ("voice2_...")."""
+
+    def __init__(self, index, tuning):
+        self.index = index
+        self.label = f"Voice {index + 1}"
+        self.prefix = "voice_" if index == 0 else f"voice{index + 1}_"
+        self.tuning = tuning
+
+    def key(self, name):
+        return self.prefix + name
 POS_RANGE = 1000
 BOX_SIZE_MAX = 3840
 BOX_POS_RANGE = 1000
@@ -225,6 +272,13 @@ class App:
             )
             if tts else None
         )
+        self.voice_slots = []
+        if tts:
+            voice2_tuning = tts.VoiceTuning(
+                speed=float(self.audio_prefs.get("voice2_speed", 1.0)),
+                volume=float(self.audio_prefs.get("voice2_volume", 1.0)),
+            )
+            self.voice_slots = [_VoiceSlot(0, self.voice_tuning), _VoiceSlot(1, voice2_tuning)]
         self._lock_while_running = []  # (widget, state to restore) for input settings
         self._monitor = None  # meter-only audio capture while stopped
         self._monitor_gen = 0
@@ -237,6 +291,11 @@ class App:
         self._voice_listen_out = None
         self._voice_listen_btns = []
         self._voice_out = None  # the running VoiceOutput
+        # Cloud connections of the current (or last) run: [(label, seconds)],
+        # and the Soniox account: (spent today, balance or None, note).
+        self._connections = []
+        self._soniox_account = None
+        self._account_busy = False
         # NDI (key mode) source from a preset / the last session, selected
         # once discovery finds it.
         self._wanted_ndi_source = self.audio_prefs.get("ndi_source_name") or None
@@ -258,6 +317,7 @@ class App:
         if (REPO_ROOT / ".git").is_dir():
             threading.Thread(target=self._startup_requirements_worker, daemon=True).start()
         self.root.after(80, self._poll_queue)
+        self.root.after(1000, self._soniox_account_tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress-m>", self._toggle_mute)
         self.root.bind("<KeyPress-M>", self._toggle_mute)
@@ -432,6 +492,13 @@ class App:
             self._make_simple_button(
                 controls, "Check for Updates", self._check_for_updates
             ).pack(side="right")
+
+        # Cloud meter: how long each connection has been up (billed while
+        # connected), and the Soniox spending/balance.
+        self.cloud_var = tk.StringVar(value="")
+        ttk.Label(self.content, textvariable=self.cloud_var, foreground=MUTED_FG).pack(
+            fill="x", padx=pad["padx"], pady=(0, 4)
+        )
 
         footer = ttk.Frame(self.content)
         footer.pack(fill="x", padx=pad["padx"], pady=(0, 8))
@@ -798,6 +865,10 @@ class App:
         ttk.Label(
             self.key_engine_frames["speechmatics"], text="needs the spoken language (no Auto)", foreground=MUTED_FG,
         ).pack(side="left", padx=6)
+        # Only an organization API key can read the prepaid balance.
+        ttk.Label(self.key_engine_frames["soniox"], text="Org key (balance):").pack(side="left", padx=(6, 0))
+        self.soniox_org_key_var = tk.StringVar(value=prefs.get("soniox_org_key", ""))
+        entry(self.key_engine_frames["soniox"], self.soniox_org_key_var, show="•", width=14).pack(side="left", padx=6)
 
         ttk.Label(frame, text="Translation:").grid(row=5, column=0, sticky="w", pady=2)
         trans_row = ttk.Frame(frame)
@@ -919,7 +990,7 @@ class App:
         if hasattr(self, "source_card_var"):
             self._update_source_card()
             self._update_text_card()
-        if hasattr(self, "voice_engine_var"):
+        if hasattr(self, "voice_panel"):
             self._update_voice_card()
 
     def _on_engine_change(self, event=None):
@@ -962,7 +1033,7 @@ class App:
         if rescan:
             self._append_log(f"{len(self._sound_inputs)} audio input device(s) found.")
         self._on_audio_device_change()
-        if hasattr(self, "voice_device_combo"):
+        if hasattr(self, "voice_panel"):
             self._refresh_output_devices()
 
     def _rebuild_audio_inputs(self):
@@ -1201,7 +1272,7 @@ class App:
     def _on_target_lang_change(self, event=None):
         if hasattr(self, "source_card_var"):
             self._update_source_card()
-        if hasattr(self, "voice_lang_combo"):
+        if hasattr(self, "voice_panel"):
             self._refresh_voice_langs()
 
     # ---------- Voice (translated speech output) ----------
@@ -1213,68 +1284,31 @@ class App:
     def _build_voice_panel(self):
         win = self._make_panel_window("Voice — translated speech")
         self.voice_panel = win
-        prefs = self.audio_prefs
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=10, pady=10)
         frame.columnconfigure(1, weight=1)
 
-        def combo(var, values, width, on_change):
-            c = ttk.Combobox(frame, textvariable=var, state="readonly", values=values, width=width)
-            c.bind("<<ComboboxSelected>>", on_change)
-            self._lock_while_running.append((c, "readonly"))
-            return c
+        for slot in self.voice_slots:
+            box = ttk.LabelFrame(frame, text=f" {slot.label.upper()} ", padding=(8, 4))
+            box.grid(row=slot.index, column=0, columnspan=3, sticky="we", pady=(0, 8))
+            self._build_voice_slot(box, slot)
 
-        ttk.Label(frame, text="Voice:").grid(row=0, column=0, sticky="w", pady=2)
-        self.voice_engine_var = tk.StringVar(
-            value=VOICE_ENGINE_LABELS.get(prefs.get("voice_engine"), VOICE_ENGINE_LABELS["off"])
-        )
-        combo(self.voice_engine_var, list(VOICE_ENGINE_LABELS.values()), 24, self._on_voice_engine_change).grid(
-            row=0, column=1, sticky="w", padx=4, pady=2
-        )
-
-        ttk.Label(frame, text="Voice language:").grid(row=1, column=0, sticky="w", pady=2)
-        self.voice_lang_var = tk.StringVar(value=self._lang_label(prefs.get("voice_lang", "same")))
-        self.voice_lang_combo = combo(self.voice_lang_var, [], 18, lambda e: self._refresh_voice_names())
-        self.voice_lang_combo.grid(row=1, column=1, sticky="w", padx=4, pady=2)
-
-        ttk.Label(frame, text="Speaker:").grid(row=2, column=0, sticky="w", pady=2)
-        self.voice_name_var = tk.StringVar(value=prefs.get("voice_name", ""))
-        self.voice_name_combo = combo(self.voice_name_var, [], 28, lambda e: self._update_voice_card())
-        self.voice_name_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
-
-        ttk.Label(frame, text="Output device:").grid(row=3, column=0, sticky="w", pady=2)
-        self.voice_device_var = tk.StringVar(value=prefs.get("voice_device_label", NO_DEVICE_LABEL))
-        self.voice_device_combo = combo(self.voice_device_var, [NO_DEVICE_LABEL], 42, lambda e: self._update_voice_card())
-        self.voice_device_combo.grid(row=3, column=1, sticky="we", padx=4, pady=2)
-        self._make_simple_button(
-            frame, "Refresh", lambda: self._refresh_audio_devices(rescan=True)
-        ).grid(row=3, column=2, padx=4)
-
-        self.voice_ndi_var = tk.BooleanVar(value=bool(prefs.get("voice_ndi", False)))
-        ndi_check = ttk.Checkbutton(
-            frame, text="Also send it as the audio of the NDI output",
-            variable=self.voice_ndi_var, command=self._update_voice_card,
-        )
-        ndi_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 6))
-        self._lock_while_running.append((ndi_check, "normal"))
-
-        if tts is not None:
-            self._add_slider(frame, 5, "Speed", 0.7, 1.5, self.voice_tuning.speed, "speed",
-                             decimals=2, target=self.voice_tuning)
-            self._add_slider(frame, 6, "Volume", 0.0, 2.0, self.voice_tuning.volume, "volume",
-                             decimals=2, target=self.voice_tuning)
-            self._add_slider(frame, 7, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
+        if self.voice_tuning is not None:
+            self._add_slider(frame, 2, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
                              "buffer_ms", target=self.voice_tuning)
+        frame.columnconfigure(0, minsize=VOICE_LABEL_W)
 
         for row, text in enumerate((
             "Speaks whole sentences, a few seconds behind the speaker; it speeds up (up to +35%)"
             " as it falls behind, and skips sentences only past 20 s of delay.",
+            "Two voices (two languages) on the same device or NDI output: give each its own"
+            " channels (e.g. 1 and 2, or 1+2 and 3+4).",
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
             "Azure and Soniox voices use the keys from the Input panel.",
             "If the voice still breaks up, raise the audio buffer (it adds that much delay).",
-        ), start=8):
+        ), start=3):
             ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
                 row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0)
             )
@@ -1282,33 +1316,103 @@ class App:
         self._refresh_voice_langs()
         self._refresh_output_devices()
 
-    def _voice_engine_code(self):
-        return next((k for k, v in VOICE_ENGINE_LABELS.items() if v == self.voice_engine_var.get()), "off")
+    def _build_voice_slot(self, box, slot):
+        prefs = self.audio_prefs
+        box.columnconfigure(0, minsize=VOICE_LABEL_W - 8)
+        box.columnconfigure(1, weight=1)
 
-    def _on_voice_engine_change(self, event=None):
+        def combo(parent, var, values, width, on_change):
+            c = ttk.Combobox(parent, textvariable=var, state="readonly", values=values, width=width)
+            c.bind("<<ComboboxSelected>>", on_change)
+            self._lock_while_running.append((c, "readonly"))
+            return c
+
+        ttk.Label(box, text="Voice:").grid(row=0, column=0, sticky="w", pady=2)
+        slot.engine_var = tk.StringVar(
+            value=VOICE_ENGINE_LABELS.get(prefs.get(slot.key("engine")), VOICE_ENGINE_LABELS["off"])
+        )
+        combo(box, slot.engine_var, list(VOICE_ENGINE_LABELS.values()), 24,
+              lambda e: self._on_voice_engine_change(slot)).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+
+        # The rest only shows while the voice is on.
+        details = ttk.Frame(box)
+        details.grid(row=1, column=0, columnspan=3, sticky="we")
+        details.columnconfigure(0, minsize=VOICE_LABEL_W - 8)
+        details.columnconfigure(1, weight=1)
+        slot.details = details
+
+        ttk.Label(details, text="Voice language:").grid(row=0, column=0, sticky="w", pady=2)
+        slot.lang_var = tk.StringVar(value=self._lang_label(prefs.get(slot.key("lang"), "same")))
+        slot.lang_combo = combo(details, slot.lang_var, [], 18, lambda e: self._refresh_voice_names(slot))
+        slot.lang_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+
+        ttk.Label(details, text="Speaker:").grid(row=1, column=0, sticky="w", pady=2)
+        slot.name_var = tk.StringVar(value=prefs.get(slot.key("name"), ""))
+        slot.name_combo = combo(details, slot.name_var, [], 28, lambda e: self._update_voice_card())
+        slot.name_combo.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        ttk.Label(details, text="Output device:").grid(row=2, column=0, sticky="w", pady=2)
+        slot.device_var = tk.StringVar(value=prefs.get(slot.key("device_label"), NO_DEVICE_LABEL))
+        slot.device_combo = combo(details, slot.device_var, [NO_DEVICE_LABEL], 42,
+                                  lambda e: self._refresh_device_channels(slot))
+        slot.device_combo.grid(row=2, column=1, sticky="we", padx=4, pady=2)
+        self._make_simple_button(
+            details, "Refresh", lambda: self._refresh_audio_devices(rescan=True)
+        ).grid(row=2, column=2, padx=4)
+
+        ttk.Label(details, text="Device channels:").grid(row=3, column=0, sticky="w", pady=2)
+        slot.channels_var = tk.StringVar(value=prefs.get(slot.key("device_channels"), "1+2"))
+        slot.channels_combo = combo(details, slot.channels_var, ["1+2"], 8, lambda e: self._update_voice_card())
+        slot.channels_combo.grid(row=3, column=1, sticky="w", padx=4, pady=2)
+
+        ttk.Label(details, text="NDI:").grid(row=4, column=0, sticky="w", pady=2)
+        route = prefs.get(slot.key("ndi_route"))
+        if route not in NDI_ROUTE_LABELS:  # older versions: on/off, as channels 1+2
+            route = "1+2" if prefs.get(slot.key("ndi")) else "off"
+        slot.ndi_var = tk.StringVar(value=NDI_ROUTE_LABELS[route])
+        combo(details, slot.ndi_var, list(NDI_ROUTE_LABELS.values()), 30,
+              lambda e: self._update_voice_card()).grid(row=4, column=1, sticky="w", padx=4, pady=2)
+
+        self._add_slider(details, 5, "Speed", 0.7, 1.5, slot.tuning.speed, "speed",
+                         decimals=2, target=slot.tuning, key=slot.key("speed"))
+        self._add_slider(details, 6, "Volume", 0.0, 2.0, slot.tuning.volume, "volume",
+                         decimals=2, target=slot.tuning, key=slot.key("volume"))
+
+    def _voice_engine_code(self, slot):
+        return next((k for k, v in VOICE_ENGINE_LABELS.items() if v == slot.engine_var.get()), "off")
+
+    def _ndi_route(self, slot):
+        return next((k for k, v in NDI_ROUTE_LABELS.items() if v == slot.ndi_var.get()), "off")
+
+    def _on_voice_engine_change(self, slot):
         self._refresh_voice_langs()
 
-    def _voice_lang_choice(self):
-        return self._lang_code(self.voice_lang_var.get(), "same")
+    def _voice_lang_choice(self, slot):
+        return self._lang_code(slot.lang_var.get(), "same")
 
-    def _voice_lang_code(self):
+    def _voice_lang_code(self, slot):
         """The language the voice speaks ("Same as subtitles" resolved)."""
-        code = self._voice_lang_choice()
+        code = self._voice_lang_choice(slot)
         return self._target_lang_code() if code == "same" else code
 
     def _refresh_voice_langs(self):
-        langs = languages.ordered(languages.voices(self._voice_engine_code()))
-        self.voice_lang_combo["values"] = [SAME_LANG_LABEL] + [languages.label(c) for c in langs]
-        choice = self._voice_lang_choice()
-        if choice != "same" and choice not in langs:
-            self.voice_lang_var.set(SAME_LANG_LABEL)
-        self._refresh_voice_names()
+        for slot in self.voice_slots:
+            if self._voice_engine_code(slot) == "off":
+                slot.details.grid_remove()
+            else:
+                slot.details.grid()
+            langs = languages.ordered(languages.voices(self._voice_engine_code(slot)))
+            slot.lang_combo["values"] = [SAME_LANG_LABEL] + [languages.label(c) for c in langs]
+            choice = self._voice_lang_choice(slot)
+            if choice != "same" and choice not in langs:
+                slot.lang_var.set(SAME_LANG_LABEL)
+            self._refresh_voice_names(slot)
 
-    def _refresh_voice_names(self):
-        names = list(tts.voices_for(self._voice_engine_code(), self._voice_lang_code())) if tts else []
-        self.voice_name_combo["values"] = names
-        if self.voice_name_var.get() not in names:
-            self.voice_name_var.set(names[0] if names else "")
+    def _refresh_voice_names(self, slot):
+        names = list(tts.voices_for(self._voice_engine_code(slot), self._voice_lang_code(slot))) if tts else []
+        slot.name_combo["values"] = names
+        if slot.name_var.get() not in names:
+            slot.name_var.set(names[0] if names else "")
         self._update_voice_card()
 
     def _refresh_output_devices(self):
@@ -1318,72 +1422,128 @@ class App:
             self._append_log(f"Could not list audio output devices: {e}")
             self.output_devices = []
         labels = [NO_DEVICE_LABEL] + [label for _idx, label, _ch in self.output_devices]
-        self.voice_device_combo["values"] = labels
-        if self.voice_device_var.get() not in labels:
-            self.voice_device_var.set(NO_DEVICE_LABEL)
+        for slot in self.voice_slots:
+            slot.device_combo["values"] = labels
+            if slot.device_var.get() not in labels:
+                slot.device_var.set(NO_DEVICE_LABEL)
+            self._refresh_device_channels(slot)
+
+    def _refresh_device_channels(self, slot):
+        label = slot.device_var.get()
+        count = next((ch for _idx, lbl, ch in self.output_devices if lbl == label), 2)
+        codes = _channel_codes(count)
+        slot.channels_combo["values"] = codes
+        if slot.channels_var.get() not in codes:
+            slot.channels_var.set(codes[0])
         self._update_voice_card()
 
+    def _active_voice_slots(self):
+        return [slot for slot in self.voice_slots if self._voice_engine_code(slot) != "off"]
+
     def _update_voice_card(self):
-        if self.input_mode == "audio" and self._voice_engine_code() != "off":
+        active = self._active_voice_slots()
+        if self.input_mode == "audio" and active:
             self.voice_listen_row.pack(anchor="w", pady=(4, 0))
         else:
             self.voice_listen_row.pack_forget()
         if self.input_mode != "audio":
             self.voice_card_var.set("Audio input mode only")
             return
-        engine = self._voice_engine_code()
-        if engine == "off":
+        if not active:
             self.voice_card_var.set("Off")
             return
-        name = self.voice_name_var.get()
-        if engine == "azure":
-            speaker = f"{name[6:].replace('Neural', '')} (Azure)"
-        elif engine == "soniox":
-            speaker = f"{name} (Soniox)"
-        else:
-            speaker = f"{name.split('-')[1] if '-' in name else name} (local)"
-        outputs = [o for o, on in (
-            ("Device", self.voice_device_var.get() != NO_DEVICE_LABEL), ("NDI", self.voice_ndi_var.get())
-        ) if on]
-        where = " + ".join(outputs) if outputs else "No output selected"
-        self.voice_card_var.set(f"{speaker} · {self._voice_lang_code().upper()}\n{where}")
+        lines = []
+        for slot in active:
+            engine, name = self._voice_engine_code(slot), slot.name_var.get()
+            if engine == "azure":
+                speaker = f"{name[6:].replace('Neural', '')} (Azure)"
+            elif engine == "soniox":
+                speaker = f"{name} (Soniox)"
+            else:
+                speaker = f"{name.split('-')[1] if '-' in name else name} (local)"
+            outputs = []
+            if slot.device_var.get() != NO_DEVICE_LABEL:
+                outputs.append(f"Device {slot.channels_var.get()}")
+            route = self._ndi_route(slot)
+            if route == "own":
+                outputs.append("NDI source")
+            elif route != "off":
+                outputs.append(f"NDI {route}")
+            where = " + ".join(outputs) if outputs else "No output selected"
+            lang = self._voice_lang_code(slot).upper()
+            if len(active) == 1:
+                lines += [f"{speaker} · {lang}", where]
+            else:
+                lines.append(f"{lang} · {name} → {where}")
+        self.voice_card_var.set("\n".join(lines))
 
-    def _voice_settings(self):
-        engine = self._voice_engine_code()
-        if tts is None or engine == "off":
-            return None
-        label = self.voice_device_var.get()
-        device_index = next((idx for idx, lbl, _ch in self.output_devices if lbl == label), None)
-        if device_index is None and not self.voice_ndi_var.get() and not self._voice_listening:
-            self._append_log(
-                "Voice is on but has no output (device or NDI) — it won't be heard. "
-                "To only listen to it here, turn on the speaker on the VOICE card before Start."
+    def _voice_settings(self, output_name):
+        """[(VoiceSettings, VoiceTuning)] for the voices that are on and
+        have somewhere to play."""
+        voices = []
+        for slot in self._active_voice_slots() if tts is not None else []:
+            engine = self._voice_engine_code(slot)
+            label = slot.device_var.get()
+            device_index = next((idx for idx, lbl, _ch in self.output_devices if lbl == label), None)
+            route = self._ndi_route(slot)
+            if device_index is None and route == "off" and not self._voice_listening:
+                self._append_log(
+                    f"{slot.label} is on but has no output (device or NDI) — it won't be heard. "
+                    "To only listen to it here, turn on the speaker on the VOICE card before Start."
+                )
+                continue
+            lang = self._voice_lang_code(slot)
+            if not slot.name_var.get():
+                self._append_log(
+                    f"No {VOICE_ENGINE_LABELS[engine]} voice speaks {languages.label(lang)} — {slot.label} off."
+                )
+                continue
+            # Offline translation for the voice is only needed (and only
+            # exists for EN/PT/ES) when nothing else provides the voice's
+            # language: the captions' translation covers it if it's the same
+            # language, Azure and Claude translate into more languages too,
+            # and with Soniox the voice gets a connection of its own.
+            source = self._source_lang_code()
+            source_langs, own_stream = (), False
+            if lang == self._target_lang_code() or self._engine_code() == "azure" or self._translation_code() == "claude":
+                pass
+            elif self._engine_code() == "soniox" and source != lang:
+                own_stream = True
+                self._append_log(
+                    f"{slot.label} ({languages.label(lang)}): its own Soniox connection, translating into "
+                    f"{languages.label(lang)} (billed like the captions')."
+                )
+            else:
+                source_langs = tuple(l for l in (speech.LANGS if source == "auto" else (source,)) if l in speech.LANGS)
+                if lang not in speech.LANGS and source != lang:
+                    self._append_log(
+                        f"{slot.label}: {ENGINE_SHORT[self._engine_code()]} only translates into the subtitle "
+                        f"language, and the offline translation has no {languages.label(lang)} — "
+                        f"{slot.label} off. Use Claude translation (Input panel), or Azure."
+                    )
+                    continue
+                if source != lang:
+                    self._append_log(
+                        f"{slot.label} ({languages.label(lang)}) uses the offline translation "
+                        "(lower quality than the subtitles')."
+                    )
+            settings = tts.VoiceSettings(
+                engine=engine,
+                voice=slot.name_var.get(),
+                lang=lang,
+                source_langs=source_langs,
+                own_stream=own_stream,
+                label=slot.label,
+                device_index=device_index,
+                device_channels=_channels_of(slot.channels_var.get()),
+                ndi_channels=_channels_of(route) if route not in ("off", "own") else (),
+                ndi_source=f"{output_name} {slot.label}" if route == "own" else "",
+                azure_key=self.azure_key_var.get(),
+                azure_region=self.azure_region_var.get(),
+                soniox_key=self.soniox_key_var.get(),
             )
-            return None
-        lang = self._voice_lang_code()
-        if not self.voice_name_var.get():
-            self._append_log(f"No {VOICE_ENGINE_LABELS[engine]} voice speaks {languages.label(lang)} — voice off.")
-            return None
-        # Offline translation for the voice is only needed (and only exists
-        # for EN/PT/ES) when nothing else provides the voice's language: the
-        # captions' translation covers it if it's the same language, Azure
-        # and Claude translate into a second language too.
-        source = self._source_lang_code()
-        if lang == self._target_lang_code() or self._engine_code() == "azure" or self._translation_code() == "claude":
-            source_langs = ()
-        else:
-            source_langs = tuple(l for l in (speech.LANGS if source == "auto" else (source,)) if l in speech.LANGS)
-        return tts.VoiceSettings(
-            engine=engine,
-            voice=self.voice_name_var.get(),
-            lang=lang,
-            source_langs=source_langs,
-            device_index=device_index,
-            ndi=self.voice_ndi_var.get(),
-            azure_key=self.azure_key_var.get(),
-            azure_region=self.azure_region_var.get(),
-            soniox_key=self.soniox_key_var.get(),
-        )
+            voices.append((settings, slot.tuning))
+        return voices
 
     def _build_text_panel(self):
         win = self._make_panel_window("Text — keying, shadow & color")
@@ -2008,7 +2168,7 @@ class App:
         if not self.picking_color:
             self.preview_canvas.scan_dragto(event.x, event.y, gain=1)
 
-    def _add_slider(self, parent, row, label, lo, hi, value, attr, decimals=0, target=None, on_change=None):
+    def _add_slider(self, parent, row, label, lo, hi, value, attr, decimals=0, target=None, on_change=None, key=None):
         target = self.live_cfg if target is None else target
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=2)
         val_var = tk.StringVar(value=self._fmt(value, decimals))
@@ -2037,7 +2197,7 @@ class App:
         val_entry.bind("<FocusOut>", commit_entry)
 
         scale.set(value)
-        self.sliders[attr] = scale
+        self.sliders[key or attr] = scale
 
     @staticmethod
     def _fmt(v, decimals):
@@ -2236,7 +2396,7 @@ class App:
         data = self._collect_app_settings()
         data["azure_key"] = self.azure_key_var.get()
         data["azure_region"] = self.azure_region_var.get()
-        for service in ("soniox", "speechmatics", "claude"):
+        for service in ("soniox", "soniox_org", "speechmatics", "claude"):
             data[f"{service}_key"] = getattr(self, f"{service}_key_var").get()
         data.update({attr: getattr(self.caption_cfg, attr) for attr in CAPTION_ATTRS})
         data["caption_bold"] = self.caption_cfg.bold
@@ -2260,15 +2420,21 @@ class App:
             "hotwords": self.hotwords_var.get(),
             "translation": self._translation_code(),
             "claude_model": self.claude_model_var.get(),
-            "voice_engine": self._voice_engine_code(),
-            "voice_name": self.voice_name_var.get(),
-            "voice_lang": self._voice_lang_choice(),
-            "voice_device_label": self.voice_device_var.get(),
-            "voice_ndi": self.voice_ndi_var.get(),
         }
+        for slot in self.voice_slots:
+            route = self._ndi_route(slot)
+            values.update({
+                slot.key("engine"): self._voice_engine_code(slot),
+                slot.key("name"): slot.name_var.get(),
+                slot.key("lang"): self._voice_lang_choice(slot),
+                slot.key("device_label"): slot.device_var.get(),
+                slot.key("device_channels"): slot.channels_var.get(),
+                slot.key("ndi_route"): route,
+                slot.key("ndi"): route not in ("off", "own"),  # for older versions
+                slot.key("speed"): slot.tuning.speed,
+                slot.key("volume"): slot.tuning.volume,
+            })
         if self.voice_tuning is not None:
-            values["voice_speed"] = self.voice_tuning.speed
-            values["voice_volume"] = self.voice_tuning.volume
             values["voice_buffer_ms"] = self.voice_tuning.buffer_ms
         return {key: values[key] for key in APP_SETTING_KEYS if key in values}
 
@@ -2285,7 +2451,7 @@ class App:
             choices = (
                 ("engine", self.engine_var, ENGINE_LABELS),
                 ("translation", self.translation_var, TRANSLATION_LABELS),
-                ("voice_engine", self.voice_engine_var, VOICE_ENGINE_LABELS),
+                *((slot.key("engine"), slot.engine_var, VOICE_ENGINE_LABELS) for slot in self.voice_slots),
             )
             for key, var, labels in choices:
                 if values.get(key) in labels:
@@ -2293,7 +2459,7 @@ class App:
             # Languages the engine doesn't offer fall back in _refresh_lang_choices.
             for key, var in (
                 ("source_lang", self.source_lang_var), ("target_lang", self.target_lang_var),
-                ("voice_lang", self.voice_lang_var),
+                *((slot.key("lang"), slot.lang_var) for slot in self.voice_slots),
             ):
                 code = values.get(key)
                 if code in languages.NAMES or code in ("auto", "same"):
@@ -2310,16 +2476,7 @@ class App:
                 self._on_audio_device_change()
             if values.get("channel") in self.audio_channel_combo["values"]:
                 self.audio_channel_var.set(values["channel"])
-            self._refresh_voice_names()
-            if values.get("voice_name") in self.voice_name_combo["values"]:
-                self.voice_name_var.set(values["voice_name"])
-            if values.get("voice_device_label") in self.voice_device_combo["values"]:
-                self.voice_device_var.set(values["voice_device_label"])
-            if "voice_ndi" in values:
-                self.voice_ndi_var.set(bool(values["voice_ndi"]))
-            for key, attr in (("voice_speed", "speed"), ("voice_volume", "volume"), ("voice_buffer_ms", "buffer_ms")):
-                if key in values and attr in self.sliders:
-                    self.sliders[attr].set(float(values[key]))
+            self._apply_voice_settings(values)
         mode = values.get("input_mode")
         if mode in INPUT_MODE_LABELS and not (mode == "audio" and speech is None):
             self.input_mode_var.set(INPUT_MODE_LABELS[mode])
@@ -2329,6 +2486,32 @@ class App:
         self._update_source_card()
         self._update_voice_card()
         self._update_output_card()
+
+    def _apply_voice_settings(self, values):
+        """The VOICE part of _apply_app_settings (engines and languages are
+        already set). A setup saved before there were two voices turns
+        voice 2 off."""
+        if "voice_engine" in values and "voice2_engine" not in values and len(self.voice_slots) > 1:
+            self.voice_slots[1].engine_var.set(VOICE_ENGINE_LABELS["off"])
+        self._refresh_voice_langs()
+        for slot in self.voice_slots:
+            if values.get(slot.key("name")) in slot.name_combo["values"]:
+                slot.name_var.set(values[slot.key("name")])
+            if values.get(slot.key("device_label")) in slot.device_combo["values"]:
+                slot.device_var.set(values[slot.key("device_label")])
+            self._refresh_device_channels(slot)
+            if values.get(slot.key("device_channels")) in slot.channels_combo["values"]:
+                slot.channels_var.set(values[slot.key("device_channels")])
+            route = values.get(slot.key("ndi_route"))
+            if route not in NDI_ROUTE_LABELS and slot.key("ndi") in values:
+                route = "1+2" if values[slot.key("ndi")] else "off"
+            if route in NDI_ROUTE_LABELS:
+                slot.ndi_var.set(NDI_ROUTE_LABELS[route])
+            for name in ("speed", "volume"):
+                if slot.key(name) in values and slot.key(name) in self.sliders:
+                    self.sliders[slot.key(name)].set(float(values[slot.key(name)]))
+        if "voice_buffer_ms" in values and "buffer_ms" in self.sliders:
+            self.sliders["buffer_ms"].set(float(values["voice_buffer_ms"]))
 
     def _current_ndi_source_name(self):
         idx = self.source_combo.current()
@@ -2439,8 +2622,8 @@ class App:
         if event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
             return
         self.muted = not self.muted
-        if self.voice_tuning is not None:
-            self.voice_tuning.muted = self.muted
+        for slot in self.voice_slots:
+            slot.tuning.muted = self.muted
         if self.muted:
             self.mute_btn.set_variant("muted")
             self._append_log("Mute enabled — NDI output is now fully transparent and the voice is silent.")
@@ -2495,10 +2678,12 @@ class App:
                 else:
                     self._append_log("Select an audio input device before starting.")
                 return
-            voice_settings = self._voice_settings()
-            if voice_settings is not None and voice_settings.lang != settings.target_lang:
-                settings.extra_target_langs = (voice_settings.lang,)
-            target, args = self._run_audio_pipeline, (settings, voice_settings, output_name)
+            voices = self._voice_settings(output_name)
+            settings.extra_target_langs = tuple(dict.fromkeys(
+                v.lang for v, _tuning in voices if v.lang != settings.target_lang
+            ))
+            settings.extra_sessions = tuple(dict.fromkeys(v.lang for v, _tuning in voices if v.own_stream))
+            target, args = self._run_audio_pipeline, (settings, voices, output_name)
         else:
             idx = self.source_combo.current()
             if idx < 0 or idx >= len(self.sources):
@@ -2583,13 +2768,14 @@ class App:
             self.msg_queue.put(("log", "Stopped."))
             self.msg_queue.put(("stopped", None))
 
-    def _run_audio_pipeline(self, settings, voice_settings, output_name):
+    def _run_audio_pipeline(self, settings, voices, output_name):
         """Audio mode: the speech engine (own thread) feeds a CaptionBoard;
         this loop renders the visible caption lines, runs them through the
         same keyer/shadow/box and output placement as the NDI mode, and
         sends a frame per output frame period. Captions are only re-rendered
         when the text or a setting changes. If a voice is configured, each
-        final sentence is also spoken (VoiceOutput runs its own threads)."""
+        final sentence is also spoken, by each of the `voices` (VoiceOutput
+        runs its own threads)."""
         post = self.msg_queue.put
         try:
             # Paced by this loop, not by the SDK (see ndi_io.Sender).
@@ -2607,8 +2793,10 @@ class App:
 
         board = CaptionBoard()
         voice_out = None
-        if voice_settings is not None:
-            voice_out = tts.VoiceOutput(voice_settings, self.voice_tuning, sender, log=lambda m: post(("log", m)))
+        if voices:
+            voice_out = tts.VoiceOutput(
+                voices, sender, lambda name: ndi_io.Sender(name, clock_video=False), log=lambda m: post(("log", m)),
+            )
             try:
                 voice_out.start()
             except Exception as e:
@@ -2618,6 +2806,10 @@ class App:
                 post(("voice_started", voice_out))
 
         def on_caption(text, final, info=None):
+            if info and info.get("voice_only"):  # an extra session's, for a voice
+                if voice_out is not None:
+                    voice_out.say(info)
+                return
             if info and info.get("stream"):
                 board.stream(text)
                 return
@@ -2637,6 +2829,7 @@ class App:
         last_report = time.time()
         last_preview = 0.0
         last_level = 0.0
+        last_clock = 0.0
         next_t = time.perf_counter()
         try:
             while not self.stop_event.is_set():
@@ -2673,6 +2866,9 @@ class App:
                 if now - last_level >= LEVEL_INTERVAL_S:
                     post(("audio_level", engine.level_db))
                     last_level = now
+                if now - last_clock >= 1.0:
+                    post(("connections", engine.connections()))
+                    last_clock = now
                 if now - last_report >= 2.0:
                     fps = frames / (now - last_report)
                     post(("status", f"{engine_status[0]} — {fps:.1f} fps"))
@@ -2682,12 +2878,61 @@ class App:
             post(("log", f"Error during processing: {e}"))
         finally:
             engine.stop()
+            post(("connections", engine.connections()))
             if voice_out is not None:
                 voice_out.stop()
             sender.close()
             post(("audio_level", -120.0))
             post(("log", "Stopped."))
             post(("stopped", None))
+
+    # ---------- Cloud meter ----------
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        minutes = int(seconds // 60)
+        return f"{minutes // 60} h {minutes % 60:02d} min" if minutes >= 60 else f"{minutes} min"
+
+    def _update_cloud_meter(self):
+        parts = []
+        if self._connections:
+            running = bool(self.worker and self.worker.is_alive())
+            times = " · ".join(f"{label} {self._fmt_duration(sec)}" for label, sec in self._connections)
+            parts.append(f"{'Connected' if running else 'Last run'}: {times}")
+        account = self._soniox_account
+        if account is not None:
+            today, balance, note = account
+            if today is None:
+                parts.append(f"Soniox: {note}")
+            else:
+                text = f"Soniox today: ${today:.3f}" if today < 1 else f"Soniox today: ${today:.2f}"
+                text += f" · balance ${balance:.2f}" if balance is not None else f" · {note}"
+                parts.append(text)
+        self.cloud_var.set("   |   ".join(parts))
+
+    def _soniox_account_tick(self):
+        """Reads the Soniox spending at startup, then every
+        SONIOX_ACCOUNT_INTERVAL_S while running."""
+        running = bool(self.worker and self.worker.is_alive())
+        if self._soniox_account is None or running:
+            self._refresh_soniox_account()
+        self.root.after(SONIOX_ACCOUNT_INTERVAL_S * 1000, self._soniox_account_tick)
+
+    def _refresh_soniox_account(self):
+        key = self.soniox_key_var.get().strip() if hasattr(self, "soniox_key_var") else ""
+        if not key or self._account_busy or speech is None:
+            return
+        self._account_busy = True
+        org_key = self.soniox_org_key_var.get()
+
+        def work():
+            try:
+                result = speech.soniox_account(key, org_key)
+            except Exception as e:
+                result = (None, None, f"can't read the spending ({e})")
+            self.msg_queue.put(("soniox_account", result))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------- Message queue (worker thread -> UI) ----------
 
@@ -2722,6 +2967,13 @@ class App:
                 elif kind == "engine_started":
                     self._engine = payload
                     self._sync_engine_listen()
+                elif kind == "connections":
+                    self._connections = payload
+                    self._update_cloud_meter()
+                elif kind == "soniox_account":
+                    self._account_busy = False
+                    self._soniox_account = payload
+                    self._update_cloud_meter()
                 elif kind == "stopped":
                     # The engine has stopped (its capture is closed): listening
                     # moves back to the level monitor, reopened below.
@@ -2735,6 +2987,9 @@ class App:
                     self.status_var.set("Stopped.")
                     self.input_info_var.set("Input: —")
                     self._update_source_card()
+                    self._update_cloud_meter()
+                    # Soniox records the usage a few seconds after it ends.
+                    self.root.after(8000, self._refresh_soniox_account)
                     if self._pending_app_settings is not None:
                         pending, self._pending_app_settings = self._pending_app_settings, None
                         self._apply_app_settings(pending)

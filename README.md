@@ -205,14 +205,39 @@ captions keep working. Open the **VOICE** card:
   after a sentence arrives.
 - **Speaker:** the voices available for the subtitle language. Local voices
   (~65 MB each) download once, on first use.
-- **Output device:** a sound card output (headphones, interpretation
-  system, Dante...), and/or **send it as the audio of the NDI output**: the
-  same NDI source then carries the captions (video + alpha) and the voice
-  (48 kHz stereo).
+- **Output device / Device channels:** a sound card output (headphones,
+  interpretation system, Dante...), on channels 1+2 or any single channel
+  or pair the device has.
+- **NDI:** *Output audio, channels …*: the same NDI source then carries the
+  captions (video + alpha) and the voice (48 kHz) on the chosen channels —
+  the output gets as many audio channels as the highest one used (2 or 4).
+  Or *Own NDI source (audio only)*: a separate source named
+  "<output name> Voice 1" / "… Voice 2".
 - **Voice language:** *Same as subtitles*, or a different one (e.g. captions
   in Portuguese and voice in English). It is translated from the recognized
   original, not from the captions.
-- **Speed / Volume:** adjustable live.
+- **Speed / Volume:** adjustable live, per voice.
+
+**Two voices (two languages):** the panel has *Voice 1* and *Voice 2*, each
+with its own language, speaker and outputs. On the same sound card or NDI
+output, give each its own channels — e.g. *channel 1 (left)* and *channel 2
+(right)*, or *channels 1+2* and *3+4*. The VOICE card's speaker then plays
+voice 1 on the left and voice 2 on the right. Translation into the second
+language: Azure and Claude translate into it as well as they do the
+subtitles. Soniox translates into one language per connection, so a voice
+in a language other than the subtitles' (and other than the speaker's) gets
+**a second Soniox connection** on the same audio, translating into its
+language — same quality and latency, and billed like the first. With
+Speechmatics it uses the offline translation (English, Spanish or
+Portuguese only, lower quality).
+
+**Cloud meter** (main window, under Start): how long each cloud connection
+has been up in the current run ("Captions 12 min · Voice FR 12 min"; after
+Stop, the last run's), and Soniox's spending today (UTC day, re-read every
+2 minutes while running and after Stop). The prepaid **balance** needs a
+Soniox *organization* API key (console.soniox.com → Organization → API
+keys), in the Input panel's *Org key (balance)* field; the normal key
+can't read it.
 - **Audio buffer (ms):** default 200. It covers the moments when the
   machine is busy (recognition, synthesis, video). If the voice breaks up,
   raise it; it adds that much delay. Applies on Start.

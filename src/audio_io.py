@@ -261,23 +261,47 @@ class NDIAudioCapture:
         self._ndi.recv_destroy(self._recv)
 
 
+class _ListenLane:
+    """One feeder's backlog in a ListenOutput."""
+
+    def __init__(self):
+        self.chunks = []
+        self.len = 0
+        self.in_rate = None
+        self.resampler = None
+
+    def read(self, n):
+        block = np.zeros(n, dtype=np.float32)
+        filled = 0
+        while filled < n and self.chunks:
+            chunk = self.chunks[0]
+            take = min(n - filled, len(chunk))
+            block[filled:filled + take] = chunk[:take]
+            filled += take
+            if take == len(chunk):
+                self.chunks.pop(0)
+            else:
+                self.chunks[0] = chunk[take:]
+        self.len -= filled
+        return block
+
+
 class ListenOutput:
     """Plays a capture's audio on an output device (the system default if
     `device_index` is None), so the operator can hear the input before
     Start. Attach it as a capture's `listener`; feed() is called from the
     capture thread with (rate, mono) blocks at the input's native rate.
     `max_delay_s` caps the backlog (None: keep everything, for audio fed in
-    whole sentences rather than in real time, like the translated voice)."""
+    whole sentences rather than in real time, like the translated voice).
+    Two feeders at once (the two translated voices) use separate `lane`s:
+    lane 0 plays on the left, lane 1 on the right."""
 
     def __init__(self, device_index=None, max_delay_s=LISTEN_MAX_DELAY_S):
         info = sd.query_devices(device_index, kind="output")
         self.name = info["name"]
         self.rate = int(info["default_samplerate"])
         self._lock = threading.Lock()
-        self._chunks = []
-        self._len = 0
-        self._in_rate = None
-        self._resampler = None
+        self._lanes = {}
         # Input and output run on separate clocks: cap the backlog so a
         # slightly faster input can't build up an ever-growing delay.
         self._max_len = int(self.rate * max_delay_s) if max_delay_s is not None else None
@@ -289,33 +313,37 @@ class ListenOutput:
     def start(self):
         self._stream.start()
 
-    def feed(self, rate, mono):
-        if rate != self._in_rate:
-            self._in_rate, self._resampler = rate, _Resampler(rate, self.rate)
+    def add_lane(self, lane):
+        """Splits left/right from the start, before the lane's first audio."""
+        with self._lock:
+            self._lanes.setdefault(lane, _ListenLane())
+
+    def feed(self, rate, mono, lane=0):
+        with self._lock:
+            state = self._lanes.setdefault(lane, _ListenLane())
+        if rate != state.in_rate:
+            state.in_rate, state.resampler = rate, _Resampler(rate, self.rate)
         # Copy first: a sound device's callback buffer is reused, and the
         # resampler returns its input as is when the rates match.
-        out = self._resampler.process(np.array(mono, dtype=np.float32, copy=True))
+        out = state.resampler.process(np.array(mono, dtype=np.float32, copy=True))
         with self._lock:
-            self._chunks.append(out)
-            self._len += len(out)
-            while self._max_len is not None and self._len > self._max_len and len(self._chunks) > 1:
-                self._len -= len(self._chunks.pop(0))
+            state.chunks.append(out)
+            state.len += len(out)
+            while self._max_len is not None and state.len > self._max_len and len(state.chunks) > 1:
+                state.len -= len(state.chunks.pop(0))
 
     def _callback(self, outdata, frames, _time_info, _status):
-        block = np.zeros(frames, dtype=np.float32)
-        filled = 0
+        outdata[:] = 0.0
         with self._lock:
-            while filled < frames and self._chunks:
-                chunk = self._chunks[0]
-                take = min(frames - filled, len(chunk))
-                block[filled:filled + take] = chunk[:take]
-                filled += take
-                if take == len(chunk):
-                    self._chunks.pop(0)
+            lanes = list(self._lanes.items())
+            split = len(lanes) > 1 and outdata.shape[1] > 1
+            for lane, state in lanes:
+                block = state.read(frames)
+                if split:
+                    outdata[:, lane % outdata.shape[1]] += block
                 else:
-                    self._chunks[0] = chunk[take:]
-            self._len -= filled
-        outdata[:] = np.clip(block, -1.0, 1.0)[:, None]
+                    outdata += block[:, None]
+        np.clip(outdata, -1.0, 1.0, out=outdata)
 
     def close(self):
         try:

@@ -1,8 +1,10 @@
 """Translated voice (speech-to-speech) for the audio mode.
 
-Each final caption sentence is synthesized (Piper offline, or Azure neural
-voices) and played on an audio output device and/or sent as the audio of the
-NDI output — alongside the captions, which keep working as before.
+Each final caption sentence is synthesized (Piper offline, Azure or Soniox)
+and played on an audio output device and/or sent as the audio of the NDI
+output — alongside the captions, which keep working as before. There can be
+two voices, each in its own language, on separate channels of the same
+outputs (or on outputs of their own).
 
 A voice can only speak whole sentences (unlike captions, which can show a
 partial and correct it), so it runs a few seconds behind the speaker. To
@@ -97,8 +99,17 @@ class VoiceSettings:
     # offline; `source_langs` are the spoken languages to preload for that.
     lang: str = "pt"
     source_langs: tuple = ()
+    # Its sentences come from a recognition session of its own (a second
+    # Soniox connection translating into its language): it speaks only
+    # those, marked info["voice_only"] = its language.
+    own_stream: bool = False
+    label: str = "Voice"  # for the Log ("Voice 2 error: ...")
     device_index: int = None  # audio output device, or None
-    ndi: bool = False  # also send the voice as the NDI output's audio
+    device_channels: tuple = (0, 1)  # the device's channels it plays on (0-based)
+    # Channels of the NDI output's audio it plays on (0-based; () = not
+    # sent), and/or a separate, audio-only NDI source with this name.
+    ndi_channels: tuple = ()
+    ndi_source: str = ""
     azure_key: str = ""
     azure_region: str = ""
     soniox_key: str = ""
@@ -348,60 +359,125 @@ class _AudioBuffer:
         return out
 
 
-class VoiceOutput:
-    def __init__(self, settings, tuning, ndi_sender, log):
-        self.settings = settings
-        self.tuning = tuning
-        self.log = log
-        self._buffer_s = max(0.02, tuning.buffer_ms / 1000.0)
-        self._sender = ndi_sender if settings.ndi else None
-        self._texts = queue.Queue()
-        self._buffers = []
-        self._stream = None
-        self.listener = None  # see set_listener
-        self._stop = threading.Event()
-        self._threads = [threading.Thread(target=self._synth_loop, daemon=True)]
-        if self._sender is not None:
-            self._ndi_buf = _AudioBuffer(NDI_RATE)
-            self._buffers.append(self._ndi_buf)
-            self._threads.append(threading.Thread(target=self._ndi_loop, daemon=True))
+class _Mix:
+    """One audio output (a sound device or an NDI source), shared by the
+    voices routed to it: each voice has its own buffer, played on its own
+    channels, so two voices don't queue behind each other."""
+
+    def __init__(self, rate, channels):
+        self.rate = rate
+        self.channels = channels
+        self._routes = []
+
+    def route(self, channels, gain):
+        buf = _AudioBuffer(self.rate)
+        self._routes.append((buf, channels, gain))
+        return buf
+
+    def read(self, n):
+        """(channels, n) float32."""
+        out = np.zeros((self.channels, n), dtype=np.float32)
+        for buf, channels, gain in self._routes:
+            block = buf.read(n) * gain()
+            for c in channels:
+                out[c] += block
+        return np.clip(out, -1.0, 1.0)
+
+
+class _DeviceOutput:
+    def __init__(self, device_index, channels, buffer_s):
+        import sounddevice as sd
+
+        info = sd.query_devices(device_index)
+        self.mix = _Mix(int(info["default_samplerate"]), channels)
+        self._stream = sd.OutputStream(
+            device=device_index, samplerate=self.mix.rate, channels=channels, dtype="float32",
+            latency=buffer_s, callback=self._callback,
+        )
 
     def start(self):
-        s = self.settings
-        if s.device_index is not None:
-            import sounddevice as sd
+        self._stream.start()
 
-            info = sd.query_devices(s.device_index)
-            rate = int(info["default_samplerate"])
-            self._dev_buf = _AudioBuffer(rate)
-            self._buffers.append(self._dev_buf)
-            channels = min(2, int(info["max_output_channels"]))
-            self._stream = sd.OutputStream(
-                device=s.device_index, samplerate=rate, channels=channels, dtype="float32",
-                latency=self._buffer_s, callback=self._device_callback,
-            )
-            self._stream.start()
-        for t in self._threads:
-            t.start()
+    def stop(self):
+        self._stream.stop()
+        self._stream.close()
+
+    def _callback(self, outdata, frames, _time_info, _status):
+        outdata[:] = self.mix.read(frames).T
+
+
+class _NdiOutput:
+    """Sends a continuous 48 kHz stream (silence between sentences) in
+    frames of the buffer size, paced on an absolute schedule (not by SDK
+    clocking, which would freeze the app — see ndi_io.Sender). The SDK's
+    synthesized timecodes follow the sample count, so receivers still see an
+    even stream. `own`: the sender is this output's (closed on stop)."""
+
+    def __init__(self, sender, channels, buffer_s, log, own=False):
+        self.mix = _Mix(NDI_RATE, channels)
+        self._sender = sender
+        self._own = own
+        self._n = int(NDI_RATE * buffer_s)
+        self.log = log
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
 
     def stop(self):
         self._stop.set()
-        for t in self._threads:
-            t.join(timeout=3.0)
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+        self._thread.join(timeout=3.0)
+        if self._own:
+            self._sender.close()
 
-    def set_listener(self, listener):
-        """Also plays each synthesized sentence on `listener` (an
-        audio_io.ListenOutput, unbounded), so the operator can hear the
-        voice; None stops. Callable from any thread."""
-        self.listener = listener
+    def _loop(self):
+        n = self._n
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            try:
+                self._sender.send_audio(self.mix.read(n), NDI_RATE)
+            except Exception as e:
+                self.log(f"NDI audio error: {e}")
+                return
+            next_t += n / NDI_RATE
+            delay = next_t - time.perf_counter()
+            if delay > 0:
+                self._stop.wait(delay)
+            elif delay < -0.5:
+                next_t = time.perf_counter()
+
+
+class _Voice:
+    """One voice: synthesizes each sentence in its language and queues it on
+    the outputs it is attached to."""
+
+    def __init__(self, settings, tuning, log):
+        self.settings = settings
+        self.tuning = tuning
+        self.log = log
+        self.label = settings.label
+        self._texts = queue.Queue()
+        self._buffers = []
+        self.listener = None  # see VoiceOutput.set_listener
+        self.lane = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._synth_loop, daemon=True)
+
+    def attach(self, mix, channels):
+        self._buffers.append(mix.route(channels, self._gain))
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=3.0)
 
     def say(self, info):
-        """Queues one final sentence: the `info` dict from the speech
-        engine (see speech.py), so the voice can speak its own language."""
-        self._texts.put((time.monotonic(), info))
+        only = info.get("voice_only")
+        if self.settings.own_stream and only == self.settings.lang or not self.settings.own_stream and not only:
+            self._texts.put((time.monotonic(), info))
 
     def _pending_s(self):
         audio = max((b.seconds() for b in self._buffers), default=0.0)
@@ -443,9 +519,9 @@ class VoiceOutput:
             for src in s.source_langs:
                 if src != s.lang:
                     self._translator(src)  # load (and download) now, not on the first sentence
-            self.log(f"Voice ready ({s.voice}, speaking {s.lang}).")
+            self.log(f"{self.label} ready ({s.voice}, speaking {s.lang}).")
         except Exception as e:
-            self.log(f"Voice error: {e}")
+            self.log(f"{self.label} error: {e}")
             return
         while not self._stop.is_set():
             try:
@@ -457,7 +533,7 @@ class VoiceOutput:
             waited = time.monotonic() - queued_at
             buffered = max((b.seconds() for b in self._buffers), default=0.0)
             if waited + buffered > MAX_LAG_S:
-                self.log(f"Voice too far behind — skipped: {info.get('source', '')[:60]}")
+                self.log(f"{self.label} too far behind — skipped: {info.get('source', '')[:60]}")
                 continue
             backlog = max(0.0, self._pending_s() - SPEEDUP_START_S)
             speed = self.tuning.speed * min(SPEEDUP_MAX, 1.0 + backlog * SPEEDUP_PER_S)
@@ -473,7 +549,7 @@ class VoiceOutput:
                         buf.append(_resample(pcm, synth.rate, buf.rate))
                     self._feed_listener(synth.rate, pcm)
             except Exception as e:
-                self.log(f"Voice error: {e}")
+                self.log(f"{self.label} error: {e}")
 
     def _play(self, synth, chunks):
         """Queues a sentence on the outputs chunk by chunk, as it's
@@ -493,33 +569,104 @@ class VoiceOutput:
     def _feed_listener(self, rate, pcm):
         listener = self.listener
         if listener is not None:
-            listener.feed(rate, pcm * self._gain())
+            listener.feed(rate, pcm * self._gain(), lane=self.lane)
 
     def _gain(self):
         return 0.0 if self.tuning.muted else self.tuning.volume
 
-    def _device_callback(self, outdata, frames, _time_info, _status):
-        block = self._dev_buf.read(frames) * self._gain()
-        outdata[:] = np.clip(block, -1.0, 1.0)[:, None]
 
-    def _ndi_loop(self):
-        """Sends a continuous 48 kHz stereo stream (silence between
-        sentences) in frames of the buffer size, paced on an absolute
-        schedule (not by SDK clocking, which would freeze the app — see
-        ndi_io.Sender). The SDK's synthesized timecodes follow the sample
-        count, so receivers still see an even stream."""
-        n = int(NDI_RATE * self._buffer_s)
-        next_t = time.perf_counter()
-        while not self._stop.is_set():
-            block = np.clip(self._ndi_buf.read(n) * self._gain(), -1.0, 1.0)
+class VoiceOutput:
+    """The translated voices — one or two, each with its own VoiceSettings
+    and VoiceTuning — and the outputs they play on. Voices on the same sound
+    device or on the NDI output's audio share it, each on its own channels.
+    The buffer size is the first voice's."""
+
+    def __init__(self, voices, ndi_sender, make_sender, log):
+        """`voices`: [(VoiceSettings, VoiceTuning)]. `ndi_sender`: the NDI
+        output (for voices with ndi_channels). `make_sender(name)`: creates
+        an NDI sender, for voices with an ndi_source of their own."""
+        self.log = log
+        self._voices = [_Voice(s, t, log) for s, t in voices]
+        self._buffer_s = max(0.02, voices[0][1].buffer_ms / 1000.0)
+        self._ndi_sender = ndi_sender
+        self._make_sender = make_sender
+        self._outputs = []
+
+    def start(self):
+        try:
+            self._open_outputs()
+            for out in self._outputs:
+                out.start()
+        except Exception:
+            self._close_outputs()
+            raise
+        for v in self._voices:
+            v.start()
+
+    def _open_outputs(self):
+        voices = self._voices
+        devices = {}
+        for v in voices:
+            if v.settings.device_index is not None:
+                devices.setdefault(v.settings.device_index, []).append(v)
+        for index, members in devices.items():
+            import sounddevice as sd
+
+            available = int(sd.query_devices(index)["max_output_channels"])
+            routes = []
+            for v in members:
+                channels = tuple(c for c in v.settings.device_channels if c < available) or (0,)
+                if channels != tuple(v.settings.device_channels):
+                    self.log(f"{v.label}: the device has {available} channel(s) — playing on channel {channels[0] + 1}.")
+                routes.append((v, channels))
+            count = min(available, max(2, max(c for _v, chans in routes for c in chans) + 1))
+            out = _DeviceOutput(index, count, self._buffer_s)
+            self._outputs.append(out)
+            for v, channels in routes:
+                v.attach(out.mix, channels)
+        on_ndi = [v for v in voices if v.settings.ndi_channels]
+        if on_ndi and self._ndi_sender is not None:
+            count = max(2, max(c for v in on_ndi for c in v.settings.ndi_channels) + 1)
+            out = _NdiOutput(self._ndi_sender, count, self._buffer_s, self.log)
+            self._outputs.append(out)
+            for v in on_ndi:
+                v.attach(out.mix, v.settings.ndi_channels)
+        for v in voices:
+            if v.settings.ndi_source:
+                sender = self._make_sender(v.settings.ndi_source)
+                out = _NdiOutput(sender, 2, self._buffer_s, self.log, own=True)
+                self._outputs.append(out)
+                v.attach(out.mix, (0, 1))
+                self.log(f"{v.label}: NDI source '{v.settings.ndi_source}' (audio only).")
+
+    def _close_outputs(self):
+        for out in self._outputs:
             try:
-                self._sender.send_audio(np.vstack([block, block]), NDI_RATE)
-            except Exception as e:
-                self.log(f"NDI audio error: {e}")
-                return
-            next_t += n / NDI_RATE
-            delay = next_t - time.perf_counter()
-            if delay > 0:
-                self._stop.wait(delay)
-            elif delay < -0.5:
-                next_t = time.perf_counter()
+                out.stop()
+            except Exception:
+                pass
+        self._outputs = []
+
+    def stop(self):
+        for v in self._voices:
+            v._stop.set()
+        for v in self._voices:
+            v.stop()
+        self._close_outputs()
+
+    def set_listener(self, listener):
+        """Also plays each synthesized sentence on `listener` (an
+        audio_io.ListenOutput, unbounded), so the operator can hear the
+        voices — with two, the first on the left and the second on the
+        right. None stops. Callable from any thread."""
+        for lane, v in enumerate(self._voices):
+            if listener is not None and len(self._voices) > 1:
+                listener.add_lane(lane)
+            v.lane = lane
+            v.listener = listener
+
+    def say(self, info):
+        """Queues one final sentence: the `info` dict from the speech
+        engine (see speech.py), so each voice can speak its own language."""
+        for v in self._voices:
+            v.say(info)

@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +56,7 @@ AZURE_MERGE_IDLE_S = 1.6
 AZURE_MERGE_MAX_S = 8.0
 SONIOX_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 SONIOX_MODEL = "stt-rt-v5"
+SONIOX_API_URL = "https://api.soniox.com"
 # Silence after which Soniox ends an utterance (500-3000 ms).
 SONIOX_ENDPOINT_DELAY_MS = 500
 SPEECHMATICS_URL = "wss://eu.rt.speechmatics.com/v2/"
@@ -146,6 +147,11 @@ class SpeechSettings:
     # several languages at once; local consumers translate `info["source"]`
     # instead.
     extra_target_langs: tuple = ()
+    # Soniox translates into one language per connection: each of these
+    # languages (a voice's) gets a connection of its own on the same audio,
+    # billed like the main one. Its finals are for the voices only
+    # (info["voice_only"] = the language).
+    extra_sessions: tuple = ()
 
 
 def _best_cuda_compute_type(ctranslate2):
@@ -336,6 +342,7 @@ class _Engine:
         self.on_status = on_status
         self.error = None
         self.capture = None
+        self.tap = None  # an extra session's audio: a _TapCapture (see SonioxEngine)
         self.listener = None
         self.stop_event = threading.Event()
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
@@ -360,9 +367,16 @@ class _Engine:
         if capture is not None:
             capture.listener = listener
 
+    def connections(self):
+        """[(label, seconds connected)] per connection to a cloud service
+        since Start (none for the local engine)."""
+        return []
+
     def _open_capture(self):
         s = self.settings
-        if s.ndi_source is not None:
+        if self.tap is not None:
+            self.capture = self.tap
+        elif s.ndi_source is not None:
             self.capture = audio_io.NDIAudioCapture(s.ndi_source, s.channel)
         elif s.device_index is None:
             raise RuntimeError("No audio input device selected.")
@@ -918,6 +932,30 @@ class _Utterances:
         return []
 
 
+class _TapCapture:
+    """Capture-like access to another engine's audio (16 kHz mono blocks it
+    put() as it sends them), for an extra session on the same input."""
+
+    level_db = -120.0
+    listener = None
+
+    def __init__(self):
+        self._q = queue.Queue()
+
+    def put(self, block):
+        self._q.put(block)
+
+    def start(self):
+        pass
+
+    def read(self, timeout=0.1):
+        blocks = audio_io._drain(self._q, timeout)
+        return np.concatenate(blocks) if blocks else None
+
+    def close(self):
+        pass
+
+
 class _CloudStreamEngine(_Engine):
     """A cloud recognizer over a WebSocket: audio goes up as 16-bit PCM,
     results come down as JSON (read on a second thread). If the connection
@@ -925,6 +963,19 @@ class _CloudStreamEngine(_Engine):
     retry can't fix (a wrong key, a bad setting) stop the engine."""
 
     service = ""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label = "Captions"
+        self._taps = []  # extra sessions' audio (see _TapCapture)
+        self._helpers = []  # their engines
+        self._connected_s = 0.0
+        self._connected_at = None
+
+    def connections(self):
+        at = self._connected_at
+        seconds = self._connected_s + (time.monotonic() - at if at is not None else 0.0)
+        return [(self.label, seconds)] + [c for h in self._helpers for c in h.connections()]
 
     def _run(self):
         from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -965,6 +1016,7 @@ class _CloudStreamEngine(_Engine):
                 self.log(f"{self.service}: reconnected.")
                 self.capture.read(timeout=0)  # skip the audio of the outage
             self.on_status("Listening.")
+            self._connected_at = time.monotonic()
             reader = threading.Thread(target=self._read, args=(ws,), daemon=True)
             reader.start()
             try:
@@ -972,6 +1024,8 @@ class _CloudStreamEngine(_Engine):
                     block = self.capture.read(timeout=0.1)
                     if block is not None and len(block):
                         self._send_audio(ws, (np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+                        for tap in self._taps:
+                            tap.put(block)
                     with self._lock:
                         self._emit(self._utterances.ready())
                         if time.monotonic() - self._activity >= HOLD_IDLE_S:
@@ -983,6 +1037,8 @@ class _CloudStreamEngine(_Engine):
                 pass
             finally:
                 ws.close()
+                self._connected_s += time.monotonic() - self._connected_at
+                self._connected_at = None
                 reader.join(timeout=1.0)
                 with self._lock:
                     self._emit(self._utterances.end() + self._utterances.ready(force=True), force=True)
@@ -1084,6 +1140,35 @@ class _CloudStreamEngine(_Engine):
 
 class SonioxEngine(_CloudStreamEngine):
     service = "Soniox"
+
+    def _run(self):
+        s = self.settings
+        for lang in s.extra_sessions:
+            if lang == s.target_lang:
+                continue
+            helper = SonioxEngine(
+                replace(s, target_lang=lang, extra_sessions=(), translation="engine"),
+                self._voice_only(lang), log=lambda m, tag=lang.upper(): self.log(f"[{tag}] {m}"),
+                on_status=lambda _text: None,
+            )
+            helper.tap = _TapCapture()
+            helper.label = f"Voice {lang.upper()}"
+            self._taps.append(helper.tap)
+            self._helpers.append(helper)
+            helper.start()
+        try:
+            super()._run()
+        finally:
+            for helper in self._helpers:
+                helper.stop()
+
+    def _voice_only(self, lang):
+        """An extra session's output: its finals, for the voice speaking
+        `lang` only (not the captions)."""
+        def on_caption(text, final, info=None):
+            if final and info and info.get("source"):
+                self.on_caption(text, True, {**info, "voice_only": lang})
+        return on_caption
 
     def _check_settings(self):
         if not self.settings.soniox_key.strip():
@@ -1250,3 +1335,37 @@ class SpeechmaticsEngine(_CloudStreamEngine):
 
     def _finish(self, ws):
         ws.send(json.dumps({"message": "EndOfStream", "last_seq_no": self._seq_no}))
+
+
+def _soniox_get(path, key):
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        SONIOX_API_URL + path,
+        headers={"Authorization": f"Bearer {key.strip()}", "User-Agent": "AlphaSubs"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}")
+
+
+def soniox_account(key, org_key=""):
+    """(spent today in USD, prepaid balance in USD or None, note): today's
+    cost of the project the key belongs to (UTC day), and the organization's
+    balance, which only an organization API key can read."""
+    now = time.gmtime()
+    day = time.strftime("%Y-%m-%dT00:00:00Z", now)
+    summary = _soniox_get(
+        f"/v1/usage/summary?start_time={day}&end_time={time.strftime('%Y-%m-%dT%H:%M:%SZ', now)}", key
+    )
+    today = float(summary["total"]["total_cost_usd"])
+    if not org_key.strip():
+        return today, None, "balance: add the organization key (Input panel)"
+    try:
+        balance = _soniox_get("/v1/organization/balance", org_key)
+    except RuntimeError as e:
+        return today, None, f"balance: the organization key was refused ({e})"
+    return today, float(balance["available_balance_usd"]), ""
