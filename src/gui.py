@@ -94,6 +94,7 @@ CHANNEL_MIX_LABEL = "Mix (1+2)"
 NDI_INPUT_PREFIX = "NDI: "
 LEVEL_METER_W, LEVEL_METER_H = 140, 10
 CARD_TEXT_W = 175  # a module card's text width (its labels wrap at 180 px)
+CARD_PAD_X = 10  # a module card's left margin
 LEVEL_INTERVAL_S = 0.1
 SONIOX_ACCOUNT_INTERVAL_S = 120  # how often the Soniox spending is re-read while running
 # The app's configuration beyond the look — input, recognition, voice and the
@@ -609,7 +610,7 @@ class App:
             inner, text="Enabled", variable=self.box_enabled_var, command=self._toggle_box_enabled,
             bg=PANEL_BG, fg=FG, activebackground=PANEL_BG, activeforeground=FG,
             selectcolor=FIELD_BG, highlightthickness=0, bd=0, font=self.normal_font,
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w")
 
     def _make_arrow(self, parent):
         return tk.Label(parent, text="→", bg=BG, fg=MUTED_FG, font=(self.font_family, 18, "bold"))
@@ -619,19 +620,25 @@ class App:
         module. Reused, fixed-size flat panel-style box, matching the app's
         broadcast-console look; hover highlights its border in accent color.
         Its content is vertically centered via an inner frame that packs with
-        expand=True. `extra`, if given, is called with that inner frame so a
-        card can host a small interactive control (e.g. an inline checkbox)
-        in addition to its title/summary — that control keeps its own click
-        behavior and doesn't open the panel. `title` may be a StringVar, for
-        a card whose title follows the current mode."""
+        expand=True. `extra`, if given, is called with a strip kept at the
+        bottom of the card, so a card can host a small interactive control
+        (e.g. an inline checkbox, the listen buttons) in addition to its
+        title/summary — that control keeps its own click behavior, doesn't
+        open the panel, and stays in view however long the summary gets (the
+        summary is what gets cut). `title` may be a StringVar, for a card
+        whose title follows the current mode."""
         card = tk.Frame(
             parent, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER,
             cursor="hand2", width=200, height=92,
         )
         card.pack_propagate(False)
 
+        if extra:
+            # Packed first, so it keeps its room when the summary doesn't fit.
+            strip = tk.Frame(card, bg=PANEL_BG)
+            strip.pack(side="bottom", fill="x", padx=(CARD_PAD_X, 0), pady=(0, 5))
         inner = tk.Frame(card, bg=PANEL_BG)
-        inner.pack(expand=True)
+        inner.pack(expand=True, fill="x", padx=(CARD_PAD_X, 0))
 
         title_kw = {"textvariable": title} if isinstance(title, tk.StringVar) else {"text": title}
         title_lbl = tk.Label(
@@ -646,7 +653,7 @@ class App:
         info_lbl.pack(fill="x", anchor="w")
 
         if extra:
-            extra(inner)
+            extra(strip)
 
         def on_enter(_event):
             card.config(highlightbackground=ACCENT)
@@ -666,25 +673,17 @@ class App:
 
     def _update_source_card(self):
         if self.input_mode == "audio":
-            self.card_level_row.pack(anchor="w", pady=(4, 0))
+            self.card_level_row.pack(anchor="w")
         else:
             self.card_level_row.pack_forget()
         if self.input_mode == "audio":
             self.source_title_var.set("AUDIO INPUT")
-            # Cut to what fits on one line of the card (by width, not
-            # characters): a wrapped name would push the level meter and the
-            # listen button out of the fixed-height card.
             device = self.audio_device_var.get().strip() or "No device selected"
-            font = tkfont.Font(font=self.normal_font)
-            if font.measure(device) > CARD_TEXT_W:
-                while device and font.measure(device + "…") > CARD_TEXT_W:
-                    device = device[:-1]
-                device = device.rstrip() + "…"
             src = self._source_lang_code().upper()
             engine = ENGINE_SHORT[self._engine_code()]
             if self._translation_code() == "claude":
                 engine += " + Claude"
-            self.source_card_var.set(f"{device}\n{src} → {self._target_lang_code().upper()} · {engine}")
+            self.source_card_var.set(self._card_lines(device, f"{src} → {self._target_lang_code().upper()} · {engine}"))
             return
         self.source_title_var.set("NDI SOURCE")
         name = self.source_var.get().strip() or "No source selected"
@@ -693,6 +692,20 @@ class App:
             self.source_card_var.set(f"{name}\n{info.replace('Input: ', '')}")
         else:
             self.source_card_var.set(name)
+
+    def _card_lines(self, *lines):
+        """A card summary: each line cut to what fits on one line of the
+        card (by width, not characters), so nothing wraps into a third or
+        fourth line."""
+        font = tkfont.Font(font=self.normal_font)
+        fitted = []
+        for line in lines:
+            if font.measure(line) > CARD_TEXT_W:
+                while line and font.measure(line + "…") > CARD_TEXT_W:
+                    line = line[:-1]
+                line = line.rstrip() + "…"
+            fitted.append(line)
+        return "\n".join(fitted)
 
     def _update_text_card(self):
         if self.input_mode == "audio":
@@ -1766,7 +1779,7 @@ class App:
     def _update_voice_card(self):
         active = self._active_voice_slots()
         if self.input_mode == "audio" and active:
-            self.voice_listen_row.pack(anchor="w", pady=(4, 0))
+            self.voice_listen_row.pack(anchor="w")
         else:
             self.voice_listen_row.pack_forget()
         for slot in self.voice_slots:
@@ -1788,26 +1801,27 @@ class App:
         for slot in active:
             engine, name = self._voice_engine_code(slot), slot.name_var.get()
             if engine == "azure":
-                speaker = f"{name[6:].replace('Neural', '')} (Azure)"
+                short, kind = name[6:].replace("Neural", ""), "Azure"
             elif engine == "soniox":
-                speaker = f"{name} (Soniox)"
+                short, kind = name.removesuffix(CLONED_SUFFIX), "Soniox"
             else:
-                speaker = f"{name.split('-')[1] if '-' in name else name} (local)"
+                short, kind = name.split("-")[1] if "-" in name else name, "local"
+            # Two voices share the card: one short line each.
+            compact = len(active) > 1
             outputs = []
             if slot.device_var.get() != NO_DEVICE_LABEL:
-                outputs.append(f"Device {slot.channels_var.get()}")
+                outputs.append(f"{'Dev' if compact else 'Device'} {slot.channels_var.get()}")
             route = self._ndi_route(slot)
             if route == "own":
-                outputs.append("NDI source")
+                outputs.append("NDI src" if compact else "NDI source")
             elif route != "off":
                 outputs.append(f"NDI {route}")
-            where = " + ".join(outputs) if outputs else "No output selected"
             lang = self._voice_lang_code(slot).upper()
-            if len(active) == 1:
-                lines += [f"{speaker} · {lang}", where]
+            if compact:
+                lines.append(f"{lang} · {short} → {' + '.join(outputs) if outputs else 'no output'}")
             else:
-                lines.append(f"{lang} · {name} → {where}")
-        self.voice_card_var.set("\n".join(lines))
+                lines += [f"{short} ({kind}) · {lang}", " + ".join(outputs) if outputs else "No output selected"]
+        self.voice_card_var.set(self._card_lines(*lines))
 
     def _voice_settings(self, output_name):
         """[(VoiceSettings, VoiceTuning)] for the voices that are on and
