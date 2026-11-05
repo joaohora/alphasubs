@@ -102,7 +102,7 @@ SONIOX_ACCOUNT_INTERVAL_S = 120  # how often the Soniox spending is re-read whil
 APP_SETTING_KEYS = (
     "input_mode", "ndi_source_name", "output_name",
     "device_label", "channel", "source_lang", "target_lang", "engine", "whisper_model", "hotwords",
-    "translation", "claude_model",
+    "translation", "claude_model", "two_way",
     *(f"{prefix}{name}" for prefix in ("voice_", "voice2_") for name in (
         "engine", "name", "lang", "device_label", "device_channels", "ndi_route", "ndi", "speed", "volume",
     )),
@@ -112,6 +112,7 @@ VOICE_ENGINE_LABELS = {
     "off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)", "soniox": "Cloud (Soniox)",
 }
 NO_DEVICE_LABEL = "None"
+CLONED_SUFFIX = " (cloned)"
 VOICE_LABEL_W = 150  # the VOICE panel's label column (px)
 # Where a voice goes in NDI: channels of the NDI output's audio (next to the
 # captions' video; the output gets as many channels as the highest one
@@ -296,6 +297,8 @@ class App:
         self._connections = []
         self._soniox_account = None
         self._account_busy = False
+        self._cloned_voices = {}  # Soniox project's cloned voices: name -> ID
+        self._clones_loaded = False
         # NDI (key mode) source from a preset / the last session, selected
         # once discovery finds it.
         self._wanted_ndi_source = self.audio_prefs.get("ndi_source_name") or None
@@ -318,6 +321,7 @@ class App:
             threading.Thread(target=self._startup_requirements_worker, daemon=True).start()
         self.root.after(80, self._poll_queue)
         self.root.after(1000, self._soniox_account_tick)
+        self.root.after(1500, self._load_cloned_voices)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress-m>", self._toggle_mute)
         self.root.bind("<KeyPress-M>", self._toggle_mute)
@@ -827,6 +831,14 @@ class App:
         self.target_lang_var = tk.StringVar(value=self._lang_label(prefs.get("target_lang", "pt")))
         self.target_lang_combo = combo(lang_row, self.target_lang_var, [], 12, self._on_target_lang_change)
         self.target_lang_combo.pack(side="left", padx=6)
+        # Soniox only: a conversation, both languages spoken (each translated
+        # into the other, on one connection).
+        self.two_way_var = tk.BooleanVar(value=bool(prefs.get("two_way", False)))
+        self.two_way_check = ttk.Checkbutton(
+            lang_row, text="Both spoken (conversation)", variable=self.two_way_var,
+            command=self._on_target_lang_change,
+        )
+        self._lock_while_running.append((self.two_way_check, "normal"))
 
         ttk.Label(frame, text="Engine:").grid(row=3, column=0, sticky="w", pady=2)
         self.engine_var = tk.StringVar(value=ENGINE_LABELS.get(prefs.get("engine"), ENGINE_LABELS["local"]))
@@ -1009,6 +1021,17 @@ class App:
             self.claude_frame.grid()
         else:
             self.claude_frame.grid_remove()
+        if code == "soniox" and self._translation_code() == "engine":
+            self.two_way_check.pack(side="left", padx=6)
+        else:
+            self.two_way_check.pack_forget()
+
+    def _two_way(self):
+        """A Soniox conversation (see two_way_var), with a chosen spoken language."""
+        return (
+            self.two_way_var.get() and self._engine_code() == "soniox"
+            and self._translation_code() == "engine" and self._source_lang_code() not in ("auto", self._target_lang_code())
+        )
 
     def _refresh_audio_devices(self, rescan=False):
         if speech is None:
@@ -1252,6 +1275,7 @@ class App:
             translation=self._translation_code(),
             claude_key=self.claude_key_var.get(),
             claude_model=self.claude_model_var.get(),
+            two_way=self._two_way(),
         )
 
     def _update_level_meter(self, level_db):
@@ -1357,7 +1381,7 @@ class App:
                                   lambda e: self._refresh_device_channels(slot))
         slot.device_combo.grid(row=2, column=1, sticky="we", padx=4, pady=2)
         self._make_simple_button(
-            details, "Refresh", lambda: self._refresh_audio_devices(rescan=True)
+            details, "Refresh", lambda: (self._refresh_audio_devices(rescan=True), self._load_cloned_voices())
         ).grid(row=2, column=2, padx=4)
 
         ttk.Label(details, text="Device channels:").grid(row=3, column=0, sticky="w", pady=2)
@@ -1409,11 +1433,37 @@ class App:
             self._refresh_voice_names(slot)
 
     def _refresh_voice_names(self, slot):
-        names = list(tts.voices_for(self._voice_engine_code(slot), self._voice_lang_code(slot))) if tts else []
+        engine = self._voice_engine_code(slot)
+        names = list(tts.voices_for(engine, self._voice_lang_code(slot))) if tts else []
+        if engine == "soniox":
+            names += [f"{name}{CLONED_SUFFIX}" for name in self._cloned_voices]
         slot.name_combo["values"] = names
-        if slot.name_var.get() not in names:
+        current = slot.name_var.get()
+        # A cloned voice is kept while the list of them is still loading.
+        if current not in names and not (current.endswith(CLONED_SUFFIX) and not self._clones_loaded):
             slot.name_var.set(names[0] if names else "")
         self._update_voice_card()
+
+    def _voice_id(self, slot):
+        """The speaker to synthesize with: a cloned voice's ID, or the name."""
+        name = slot.name_var.get()
+        if name.endswith(CLONED_SUFFIX):
+            return self._cloned_voices.get(name[:-len(CLONED_SUFFIX)], name)
+        return name
+
+    def _load_cloned_voices(self):
+        """Reads the voices cloned in the Soniox project (in the background)."""
+        key = self.soniox_key_var.get().strip() if hasattr(self, "soniox_key_var") else ""
+        if not key or tts is None:
+            return
+
+        def work():
+            try:
+                self.msg_queue.put(("cloned_voices", tts.soniox_cloned_voices(key)))
+            except Exception as e:
+                self.msg_queue.put(("log", f"Could not read the Soniox cloned voices: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_output_devices(self):
         try:
@@ -1507,6 +1557,8 @@ class App:
             source_langs, own_stream = (), False
             if lang == self._target_lang_code() or self._engine_code() == "azure" or self._translation_code() == "claude":
                 pass
+            elif self._two_way() and lang == source:  # the conversation's other language
+                pass
             elif self._engine_code() == "soniox" and source != lang:
                 own_stream = True
                 self._append_log(
@@ -1529,7 +1581,7 @@ class App:
                     )
             settings = tts.VoiceSettings(
                 engine=engine,
-                voice=slot.name_var.get(),
+                voice=self._voice_id(slot),
                 lang=lang,
                 source_langs=source_langs,
                 own_stream=own_stream,
@@ -2419,6 +2471,7 @@ class App:
             "whisper_model": self.whisper_model_var.get(),
             "hotwords": self.hotwords_var.get(),
             "translation": self._translation_code(),
+            "two_way": self.two_way_var.get(),
             "claude_model": self.claude_model_var.get(),
         }
         for slot in self.voice_slots:
@@ -2466,6 +2519,9 @@ class App:
                     var.set(self._lang_label(code))
             self._show_engine_frames()
             self._refresh_lang_choices()
+            if "two_way" in values:
+                self.two_way_var.set(bool(values["two_way"]))
+                self._show_engine_frames()
             for key, var in (("whisper_model", self.whisper_model_var), ("hotwords", self.hotwords_var)):
                 if key in values:
                     var.set(values[key])
@@ -2678,6 +2734,11 @@ class App:
                 else:
                     self._append_log("Select an audio input device before starting.")
                 return
+            if self.two_way_var.get() and self._engine_code() == "soniox" and not settings.two_way:
+                self._append_log(
+                    "Conversation off: choose the spoken language (not Auto, nor the subtitles' language), "
+                    "and translation by the engine."
+                )
             voices = self._voice_settings(output_name)
             settings.extra_target_langs = tuple(dict.fromkeys(
                 v.lang for v, _tuning in voices if v.lang != settings.target_lang
@@ -2967,6 +3028,10 @@ class App:
                 elif kind == "engine_started":
                     self._engine = payload
                     self._sync_engine_listen()
+                elif kind == "cloned_voices":
+                    self._cloned_voices, self._clones_loaded = payload, True
+                    for slot in self.voice_slots:
+                        self._refresh_voice_names(slot)
                 elif kind == "connections":
                     self._connections = payload
                     self._update_cloud_meter()

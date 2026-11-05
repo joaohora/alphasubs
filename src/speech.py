@@ -152,6 +152,9 @@ class SpeechSettings:
     # billed like the main one. Its finals are for the voices only
     # (info["voice_only"] = the language).
     extra_sessions: tuple = ()
+    # Soniox: a conversation — both source_lang and target_lang are spoken,
+    # and each is translated into the other (one connection, "two_way").
+    two_way: bool = False
 
 
 def _best_cuda_compute_type(ctranslate2):
@@ -1008,7 +1011,8 @@ class _CloudStreamEngine(_Engine):
                 continue
             if not connected_once:
                 self.log(
-                    f"Listening ({self.service}, {self.settings.source_lang} -> {self.settings.target_lang}"
+                    f"Listening ({self.service}, {self.settings.source_lang} "
+                    f"{'<->' if getattr(self.settings, 'two_way', False) else '->'} {self.settings.target_lang}"
                     f"{'' if self.translation is None else ', translation by Claude'})."
                 )
                 connected_once = True
@@ -1115,6 +1119,8 @@ class _CloudStreamEngine(_Engine):
         texts = {}
         if lang == s.target_lang:
             texts[s.target_lang] = item["source"]
+            if s.two_way and item["translation"]:  # a conversation's other language
+                texts[s.source_lang] = _tidy("".join(item["translation"]))
         elif item["translation"]:
             texts[s.target_lang] = _tidy("".join(item["translation"]))
         elif self.translation is None:
@@ -1140,6 +1146,7 @@ class _CloudStreamEngine(_Engine):
 
 class SonioxEngine(_CloudStreamEngine):
     service = "Soniox"
+    _spoken = None  # the language of the last spoken token
 
     def _run(self):
         s = self.settings
@@ -1147,7 +1154,7 @@ class SonioxEngine(_CloudStreamEngine):
             if lang == s.target_lang:
                 continue
             helper = SonioxEngine(
-                replace(s, target_lang=lang, extra_sessions=(), translation="engine"),
+                replace(s, target_lang=lang, extra_sessions=(), translation="engine", two_way=False),
                 self._voice_only(lang), log=lambda m, tag=lang.upper(): self.log(f"[{tag}] {m}"),
                 on_status=lambda _text: None,
             )
@@ -1189,7 +1196,10 @@ class SonioxEngine(_CloudStreamEngine):
             "num_channels": 1,
             # Hints only bias recognition: with Auto, other languages are
             # still detected.
-            "language_hints": list(LANGS) if s.source_lang == "auto" else [s.source_lang],
+            "language_hints": (
+                list(LANGS) if s.source_lang == "auto"
+                else [s.source_lang, s.target_lang] if s.two_way else [s.source_lang]
+            ),
             "enable_language_identification": True,
             "enable_endpoint_detection": True,
             "max_endpoint_delay_ms": SONIOX_ENDPOINT_DELAY_MS,
@@ -1199,7 +1209,9 @@ class SonioxEngine(_CloudStreamEngine):
         terms = [t.strip() for t in s.hotwords.split(",") if t.strip()]
         if terms:
             config["context"] = {"terms": terms}
-        if self.translating:
+        if self.translating and s.two_way:
+            config["translation"] = {"type": "two_way", "language_a": s.source_lang, "language_b": s.target_lang}
+        elif self.translating:
             config["translation"] = {"type": "one_way", "target_language": s.target_lang}
         ws.send(json.dumps(config))
         return ws
@@ -1224,8 +1236,14 @@ class SonioxEngine(_CloudStreamEngine):
                 continue
             # Confirmed caption-language text: translations, and speech
             # already in the caption language ("none"; "original" tokens get
-            # translated).
-            if final and status != "original":
+            # translated). In a conversation both languages get translated:
+            # the caption language is the one not spoken last.
+            if status != "translation" and token.get("language"):
+                self._spoken = token["language"]
+            if final and (
+                status != "original" if not self.settings.two_way
+                else (status == "translation") != (self._spoken == self.settings.target_lang)
+            ):
                 self._confirmed.caption(text)
             if status == "translation":
                 if final:

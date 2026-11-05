@@ -231,6 +231,23 @@ language — same quality and latency, and billed like the first. With
 Speechmatics it uses the offline translation (English, Spanish or
 Portuguese only, lower quality).
 
+A voice never repeats what was said in its own language: the listeners
+already heard the original.
+
+**Conversation (Soniox):** for two people speaking two languages on the same
+signal (e.g. an interview, PT ↔ EN), set *Spoken language* to one of them,
+*Subtitles in* to the other, and tick *Both spoken (conversation)*. One
+connection then translates each language into the other: the subtitles
+stay in one language, and with Voice 1 in PT and Voice 2 in EN, each voice
+speaks only the other person's words. With cloned voices (below), each
+person can be heard in their own voice.
+
+**Cloned voices (Soniox):** voices created in the Soniox Console (Project →
+Voices → Create voice, from 10 s–2 min of clean speech by one person)
+appear in the *Speaker* list as "<name> (cloned)", in every language. Only
+clone someone with their written consent, and tell the audience the voice
+is synthetic.
+
 **Cloud meter** (main window, under Start): how long each cloud connection
 has been up in the current run ("Captions 12 min · Voice FR 12 min"; after
 Stop, the last run's), and Soniox's spending today (UTC day, re-read every

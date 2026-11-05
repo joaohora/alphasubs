@@ -83,6 +83,23 @@ MAX_LAG_S = 20.0
 CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
 
 
+def soniox_cloned_voices(key):
+    """{name: voice ID} of the voices cloned in the key's Soniox project
+    that are ready for the TTS model."""
+    import json
+
+    request = urllib.request.Request(
+        "https://api.soniox.com/v1/voices",
+        headers={"Authorization": f"Bearer {key.strip()}", "User-Agent": "AlphaSubs"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as resp:
+        voices = json.loads(resp.read())["voices"]
+    return {
+        v["name"]: v["id"] for v in voices
+        if any(m.get("model") == SONIOX_TTS_MODEL and m.get("status") == "ready" for m in v.get("models", []))
+    }
+
+
 def voices_for(engine, lang):
     if engine == "soniox":
         return SONIOX_VOICES.get(lang, SONIOX_VOICES_OTHER)
@@ -475,6 +492,8 @@ class _Voice:
         self._thread.join(timeout=3.0)
 
     def say(self, info):
+        if info.get("lang") == self.settings.lang:
+            return  # said in its own language: the listeners heard the original
         only = info.get("voice_only")
         if self.settings.own_stream and only == self.settings.lang or not self.settings.own_stream and not only:
             self._texts.put((time.monotonic(), info))
