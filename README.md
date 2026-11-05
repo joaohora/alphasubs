@@ -221,8 +221,7 @@ captions keep working. Open the **VOICE** card:
 **Two voices (two languages):** the panel has *Voice 1* and *Voice 2*, each
 with its own language, speaker and outputs. On the same sound card or NDI
 output, give each its own channels — e.g. *channel 1 (left)* and *channel 2
-(right)*, or *channels 1+2* and *3+4*. The VOICE card's speaker then plays
-voice 1 on the left and voice 2 on the right. Translation into the second
+(right)*, or *channels 1+2* and *3+4*. Translation into the second
 language: Azure and Claude translate into it as well as they do the
 subtitles. Soniox translates into one language per connection, so a voice
 in a language other than the subtitles' (and other than the speaker's) gets
@@ -233,6 +232,19 @@ Portuguese only, lower quality).
 
 A voice never repeats what was said in its own language: the listeners
 already heard the original.
+
+**Original under the voices (ducking):** *Original under voices* plays the
+input's sound on the voices' channels too — at full level between
+sentences, and lowered to the chosen level (−6 to −30 dB) while the voice
+speaks, coming back smoothly about half a second after it stops. The
+listeners always hear the speaker underneath the translation. *Off*: the
+voices only. It can be changed while running; Mute silences it too.
+
+**Monitoring:** the VOICE card has a speaker per voice (numbered 1 and 2
+when both are on), playing on this computer's default output what that
+voice's outputs carry, the original under it included. Both on: voice 1 on
+the left, voice 2 on the right. A voice with no device or NDI output still
+runs if its speaker is on before Start.
 
 **Conversation (Soniox):** for two people speaking two languages on the same
 signal (e.g. an interview, PT ↔ EN), set *Spoken language* to one of them,

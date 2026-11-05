@@ -106,12 +106,18 @@ APP_SETTING_KEYS = (
     *(f"{prefix}{name}" for prefix in ("voice_", "voice2_") for name in (
         "engine", "name", "lang", "device_label", "device_channels", "ndi_route", "ndi", "speed", "volume",
     )),
-    "voice_buffer_ms",
+    "voice_buffer_ms", "voice_duck",
 )
 VOICE_ENGINE_LABELS = {
     "off": "Off", "local": "Local (Piper, offline)", "azure": "Cloud (Azure neural)", "soniox": "Cloud (Soniox)",
 }
 NO_DEVICE_LABEL = "None"
+# The original sound under the voices: its level while a voice speaks (dB),
+# back to full between sentences ("ducking"); "off" = the voices only.
+DUCK_LABELS = {
+    "off": "Off (voices only)",
+    **{str(db): f"{db} dB while the voice speaks" for db in (-6, -10, -15, -20, -25, -30)},
+}
 CLONED_SUFFIX = " (cloned)"
 VOICE_LABEL_W = 150  # the VOICE panel's label column (px)
 # Where a voice goes in NDI: channels of the NDI output's audio (next to the
@@ -154,6 +160,8 @@ class _VoiceSlot:
         self.label = f"Voice {index + 1}"
         self.prefix = "voice_" if index == 0 else f"voice{index + 1}_"
         self.tuning = tuning
+        self.listening = False  # monitored on this computer (VOICE card speaker)
+        self.listen_btns = []
 
     def key(self, name):
         return self.prefix + name
@@ -287,11 +295,10 @@ class App:
         self._listen_out = None
         self._listen_btns = []
         self._engine = None  # the running speech engine (audio mode), for listening
-        # Listening to the translated voice (VOICE card), while it runs.
-        self._voice_listening = False
-        self._voice_listen_out = None
-        self._voice_listen_btns = []
+        # Listening to the translated voices: see _VoiceSlot.listening.
         self._voice_out = None  # the running VoiceOutput
+        duck = str(self.audio_prefs.get("voice_duck", "off"))
+        self.voice_duck_var = tk.StringVar(value=DUCK_LABELS.get(duck, DUCK_LABELS["off"]))
         # Cloud connections of the current (or last) run: [(label, seconds)],
         # and the Soniox account: (spent today, balance or None, note).
         self._connections = []
@@ -566,10 +573,21 @@ class App:
         ).pack(side="left")
 
     def _add_voice_card_listen(self, inner):
-        """Extra content for the VOICE card: the listen (speaker) toggle, to
-        hear the translated voice on this computer while it runs."""
+        """Extra content for the VOICE card: a listen (speaker) toggle per
+        voice, to hear each on this computer while it runs, and the
+        original's level under the voices."""
         self.voice_listen_row = tk.Frame(inner, bg=PANEL_BG)
-        self._make_listen_button(self.voice_listen_row, 16, bg=PANEL_BG, voice=True).pack(side="left")
+        for slot in self.voice_slots:
+            slot.listen_box = tk.Frame(self.voice_listen_row, bg=PANEL_BG)
+            slot.listen_num = tk.Label(
+                slot.listen_box, text=str(slot.index + 1), bg=PANEL_BG, fg=MUTED_FG, font=self.normal_font,
+            )
+            self._make_listen_button(slot.listen_box, 16, bg=PANEL_BG, voice=slot).pack(side="right")
+        self.voice_duck_info_var = tk.StringVar(value="")
+        tk.Label(
+            self.voice_listen_row, textvariable=self.voice_duck_info_var, bg=PANEL_BG, fg=MUTED_FG,
+            font=self.normal_font,
+        ).pack(side="right", padx=(2, 0))
 
     def _add_source_card_meter(self, inner):
         """Extra content for the input card: a small input level meter and
@@ -1198,48 +1216,48 @@ class App:
             self._set_listening(False)
             self._append_log("Nothing to listen to: select an audio input first.")
 
-    def _toggle_voice_listen(self):
-        """VOICE card speaker: plays the translated voice on the computer's
-        default output while the pipeline runs (in addition to its own
-        device/NDI outputs). It stays on across Start/Stop."""
-        self._voice_listening = not self._voice_listening
-        for btn in self._voice_listen_btns:
-            btn.set_variant("on" if self._voice_listening else "off")
+    def _toggle_voice_listen(self, slot):
+        """VOICE card speaker of one voice: plays it on the computer's
+        default output while the pipeline runs — what its outputs carry,
+        the original under it included (two voices monitored: the first on
+        the left, the second on the right). It stays on across Start/Stop."""
+        slot.listening = not slot.listening
+        for btn in slot.listen_btns:
+            btn.set_variant("on" if slot.listening else "off")
         running = bool(self.worker and self.worker.is_alive())
-        self._sync_voice_listen()
-        if not self._voice_listening:
-            self._append_log("Stopped listening to the voice.")
-        elif self._voice_listen_out is not None:
-            self._append_log(f"Listening to the translated voice on '{self._voice_listen_out.name}'.")
+        name = self._sync_voice_listen()
+        if not slot.listening:
+            self._append_log(f"Stopped listening to {slot.label}.")
+        elif name:
+            self._append_log(f"Listening to {slot.label} on '{name}'.")
         elif running:
-            self._append_log("The voice isn't running — set it up (VOICE panel) and press Start again.")
+            self._append_log(f"{slot.label} isn't running — set it up (VOICE panel) and press Start again.")
         else:
-            self._append_log("Listening to the voice: it will be heard here after Start.")
+            self._append_log(f"Listening to {slot.label}: it will be heard here after Start.")
 
     def _sync_voice_listen(self):
+        """Applies the speakers' state to the running voices; returns the
+        monitor output's name (None if not playing)."""
         voice_out = self._voice_out
         if voice_out is None:
-            return
-        if self._voice_listening:
-            if self._voice_listen_out is None:
-                try:
-                    self._voice_listen_out = audio_io.ListenOutput(max_delay_s=None)
-                    self._voice_listen_out.start()
-                except Exception as e:
-                    self._voice_listen_out = None
-                    self._append_log(f"Could not open the audio output to listen to the voice: {e}")
-            voice_out.set_listener(self._voice_listen_out)
-        else:
-            voice_out.set_listener(None)
-            self._close_voice_listen_output()
+            return None
+        try:
+            return voice_out.set_monitor({slot.label for slot in self.voice_slots if slot.listening})
+        except Exception as e:
+            self._append_log(f"Could not open the audio output to listen to the voices: {e}")
+            return None
 
-    def _close_voice_listen_output(self):
-        out, self._voice_listen_out = self._voice_listen_out, None
-        if out is not None:
-            try:
-                out.close()
-            except Exception:
-                pass
+    def _duck_code(self):
+        return next((k for k, v in DUCK_LABELS.items() if v == self.voice_duck_var.get()), "off")
+
+    def _duck_db(self):
+        code = self._duck_code()
+        return None if code == "off" else float(code)
+
+    def _on_duck_change(self):
+        if self._voice_out is not None:
+            self._voice_out.duck_db = self._duck_db()  # applies live
+        self._update_voice_card()
 
     def _set_listening(self, on):
         self._listening = on
@@ -1318,12 +1336,18 @@ class App:
             box.grid(row=slot.index, column=0, columnspan=3, sticky="we", pady=(0, 8))
             self._build_voice_slot(box, slot)
 
+        ttk.Label(frame, text="Original under voices:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        duck_combo = ttk.Combobox(
+            frame, textvariable=self.voice_duck_var, state="readonly", values=list(DUCK_LABELS.values()), width=28,
+        )
+        duck_combo.bind("<<ComboboxSelected>>", lambda e: self._on_duck_change())
+        duck_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
         if self.voice_tuning is not None:
-            self._add_slider(frame, 2, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
+            self._add_slider(frame, 3, "Audio buffer (ms, on Start)", 50, 1000, self.voice_tuning.buffer_ms,
                              "buffer_ms", target=self.voice_tuning)
         frame.columnconfigure(0, minsize=VOICE_LABEL_W)
         self._make_simple_button(frame, "Clone a voice (Soniox)...", self._open_clone_dialog).grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 2)
+            row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 2)
         )
 
         for row, text in enumerate((
@@ -1331,11 +1355,13 @@ class App:
             " as it falls behind, and skips sentences only past 20 s of delay.",
             "Two voices (two languages) on the same device or NDI output: give each its own"
             " channels (e.g. 1 and 2, or 1+2 and 3+4).",
+            "Original under voices: the input's sound also plays on the voices' channels, at full"
+            " level between sentences and lowered while the voice speaks (adjustable while running).",
             "Keep the voice out of the microphone's reach (headphones, interpretation system,"
             " stream) — otherwise it gets translated again.",
             "Azure and Soniox voices use the keys from the Input panel.",
             "If the voice still breaks up, raise the audio buffer (it adds that much delay).",
-        ), start=4):
+        ), start=5):
             ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
                 row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0)
             )
@@ -1743,6 +1769,15 @@ class App:
             self.voice_listen_row.pack(anchor="w", pady=(4, 0))
         else:
             self.voice_listen_row.pack_forget()
+        for slot in self.voice_slots:
+            slot.listen_box.pack_forget()
+            slot.listen_num.pack_forget()
+        for slot in active:
+            slot.listen_box.pack(side="left", padx=(0, 6))
+            if len(active) > 1:
+                slot.listen_num.pack(side="left", padx=(0, 2))
+        duck = self._duck_code()
+        self.voice_duck_info_var.set("" if duck == "off" else f"Orig. {duck} dB")
         if self.input_mode != "audio":
             self.voice_card_var.set("Audio input mode only")
             return
@@ -1783,7 +1818,7 @@ class App:
             label = slot.device_var.get()
             device_index = next((idx for idx, lbl, _ch in self.output_devices if lbl == label), None)
             route = self._ndi_route(slot)
-            if device_index is None and route == "off" and not self._voice_listening:
+            if device_index is None and route == "off" and not slot.listening:
                 self._append_log(
                     f"{slot.label} is on but has no output (device or NDI) — it won't be heard. "
                     "To only listen to it here, turn on the speaker on the VOICE card before Start."
@@ -2232,20 +2267,22 @@ class App:
 
         return draw
 
-    def _make_listen_button(self, parent, height, bg=BG, voice=False):
+    def _make_listen_button(self, parent, height, bg=BG, voice=None):
         """Speaker toggle that plays, on the computer's default output, the
-        selected audio input (see _toggle_listen) or, with `voice`, the
-        translated voice (see _toggle_voice_listen). Every copy of a toggle
-        (e.g. input card and input panel) follows the same state."""
-        on = self._voice_listening if voice else self._listening
+        selected audio input (see _toggle_listen) or, with `voice` (a
+        _VoiceSlot), that translated voice (see _toggle_voice_listen). Every
+        copy of a toggle (e.g. input card and input panel) follows the same
+        state."""
+        on = voice.listening if voice else self._listening
         btn = self._make_float_button(
             parent,
             {"off": ("", "neutral", self._speaker_icon(False)), "on": ("", "accent", self._speaker_icon(True))},
-            "on" if on else "off", command=self._toggle_voice_listen if voice else self._toggle_listen,
+            "on" if on else "off",
+            command=(lambda: self._toggle_voice_listen(voice)) if voice else self._toggle_listen,
             height=height, min_width=height + 8,
         )
         btn.config(bg=bg)
-        (self._voice_listen_btns if voice else self._listen_btns).append(btn)
+        (voice.listen_btns if voice else self._listen_btns).append(btn)
         return btn
 
     def _make_simple_button(self, parent, text, command, kind="neutral", height=26, min_width=0):
@@ -2736,6 +2773,7 @@ class App:
             })
         if self.voice_tuning is not None:
             values["voice_buffer_ms"] = self.voice_tuning.buffer_ms
+        values["voice_duck"] = self._duck_code()
         return {key: values[key] for key in APP_SETTING_KEYS if key in values}
 
     def _apply_app_settings(self, values):
@@ -2815,6 +2853,8 @@ class App:
                     self.sliders[slot.key(name)].set(float(values[slot.key(name)]))
         if "voice_buffer_ms" in values and "buffer_ms" in self.sliders:
             self.sliders["buffer_ms"].set(float(values["voice_buffer_ms"]))
+        if str(values.get("voice_duck")) in DUCK_LABELS:
+            self.voice_duck_var.set(DUCK_LABELS[str(values["voice_duck"])])
 
     def _current_ndi_source_name(self):
         idx = self.source_combo.current()
@@ -2991,7 +3031,7 @@ class App:
                 v.lang for v, _tuning in voices if v.lang != settings.target_lang
             ))
             settings.extra_sessions = tuple(dict.fromkeys(v.lang for v, _tuning in voices if v.own_stream))
-            target, args = self._run_audio_pipeline, (settings, voices, output_name)
+            target, args = self._run_audio_pipeline, (settings, voices, output_name, self._duck_db())
         else:
             idx = self.source_combo.current()
             if idx < 0 or idx >= len(self.sources):
@@ -3076,14 +3116,15 @@ class App:
             self.msg_queue.put(("log", "Stopped."))
             self.msg_queue.put(("stopped", None))
 
-    def _run_audio_pipeline(self, settings, voices, output_name):
+    def _run_audio_pipeline(self, settings, voices, output_name, duck_db):
         """Audio mode: the speech engine (own thread) feeds a CaptionBoard;
         this loop renders the visible caption lines, runs them through the
         same keyer/shadow/box and output placement as the NDI mode, and
         sends a frame per output frame period. Captions are only re-rendered
         when the text or a setting changes. If a voice is configured, each
         final sentence is also spoken, by each of the `voices` (VoiceOutput
-        runs its own threads)."""
+        runs its own threads), with the original under them at `duck_db`
+        (None: not)."""
         post = self.msg_queue.put
         try:
             # Paced by this loop, not by the SDK (see ndi_io.Sender).
@@ -3104,6 +3145,7 @@ class App:
         if voices:
             voice_out = tts.VoiceOutput(
                 voices, sender, lambda name: ndi_io.Sender(name, clock_video=False), log=lambda m: post(("log", m)),
+                duck_db=duck_db,
             )
             try:
                 voice_out.start()
@@ -3127,6 +3169,8 @@ class App:
                 voice_out.say(info)
 
         engine = speech.create_engine(settings, on_caption, log=lambda m: post(("log", m)), on_status=on_status)
+        if voice_out is not None:
+            engine.set_original(voice_out.feed_original)  # the original under the voices
         engine.start()
         post(("engine_started", engine))
         post(("log", f"Captioning audio -> sending '{output_name}'."))
@@ -3294,7 +3338,6 @@ class App:
                     self._engine = None
                     self._close_listen_output()
                     self._voice_out = None
-                    self._close_voice_listen_output()
                     self._set_running_visual(False)
                     self.source_combo.config(state="readonly")
                     self._set_input_settings_locked(False)

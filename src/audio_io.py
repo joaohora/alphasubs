@@ -111,7 +111,9 @@ class AudioCapture:
     read() returns 16 kHz mono float32 blocks; `level_db` holds the latest
     input level (dBFS) for a meter. With `meter_only`, audio isn't kept at
     all — only the level is updated (the pre-Start signal check). Setting
-    `listener` (a ListenOutput) also plays the input, meter_only or not."""
+    `listener` (a ListenOutput) also plays the input, meter_only or not;
+    `original`, a function (rate, mono), also gets every block (the
+    original sound under the translated voices)."""
 
     def __init__(self, device_index, channel=None, meter_only=False):
         info = sd.query_devices(device_index)
@@ -124,6 +126,7 @@ class AudioCapture:
         self.native_rate = int(info["default_samplerate"])
         self.level_db = -120.0
         self.listener = None
+        self.original = None
         self._q = queue.Queue(maxsize=400)
         self._resampler = _Resampler(self.native_rate)
         self._stream = sd.InputStream(
@@ -141,6 +144,9 @@ class AudioCapture:
         listener = self.listener
         if listener is not None:
             listener.feed(self.native_rate, mono)
+        original = self.original
+        if original is not None:
+            original(self.native_rate, mono)
         if self.meter_only:
             return
         try:
@@ -209,6 +215,7 @@ class NDIAudioCapture:
         self.meter_only = meter_only
         self.level_db = -120.0
         self.listener = None
+        self.original = None  # see AudioCapture
         self._q = queue.Queue(maxsize=400)
         self._rate = None
         self._resampler = None
@@ -236,6 +243,9 @@ class NDIAudioCapture:
                 listener = self.listener
                 if listener is not None:
                     listener.feed(rate, mono)
+                original = self.original
+                if original is not None:
+                    original(rate, mono)
                 if not self.meter_only:
                     try:
                         self._q.put_nowait((rate, mono))

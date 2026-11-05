@@ -347,6 +347,7 @@ class _Engine:
         self.capture = None
         self.tap = None  # an extra session's audio: a _TapCapture (see SonioxEngine)
         self.listener = None
+        self.original = None
         self.stop_event = threading.Event()
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
 
@@ -370,6 +371,15 @@ class _Engine:
         if capture is not None:
             capture.listener = listener
 
+    def set_original(self, feed):
+        """Also passes the captured audio, live, to `feed(rate, mono)` (the
+        original sound under the translated voices), or stops with None.
+        Like set_listener()."""
+        self.original = feed
+        capture = self.capture
+        if capture is not None:
+            capture.original = feed
+
     def connections(self):
         """[(label, seconds connected)] per connection to a cloud service
         since Start (none for the local engine)."""
@@ -386,6 +396,7 @@ class _Engine:
         else:
             self.capture = audio_io.AudioCapture(s.device_index, s.channel)
         self.capture.listener = self.listener
+        self.capture.original = self.original
         self.capture.start()
 
     def _thread_main(self):
@@ -941,6 +952,7 @@ class _TapCapture:
 
     level_db = -120.0
     listener = None
+    original = None
 
     def __init__(self):
         self._q = queue.Queue()

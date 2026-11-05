@@ -4,7 +4,9 @@ Each final caption sentence is synthesized (Piper offline, Azure or Soniox)
 and played on an audio output device and/or sent as the audio of the NDI
 output — alongside the captions, which keep working as before. There can be
 two voices, each in its own language, on separate channels of the same
-outputs (or on outputs of their own).
+outputs (or on outputs of their own). The original sound (the input) can
+play under the voices, lowered while they speak ("ducking"), and the
+operator can monitor each voice on this computer's default output.
 
 A voice can only speak whole sentences (unlike captions, which can show a
 partial and correct it), so it runs a few seconds behind the speaker. To
@@ -81,6 +83,16 @@ SPEEDUP_PER_S = 0.06
 SPEEDUP_MAX = 1.35
 MAX_LAG_S = 20.0
 CHARS_PER_S = 15.0  # rough speaking rate, to estimate not-yet-synthesized text
+# Ducking: the original drops to the chosen level within ~DUCK_ATTACK_S of a
+# voice starting and comes back over ~DUCK_RELEASE_S once it has been silent
+# for DUCK_HOLD_S (the pauses between sentences and synthesis chunks don't
+# make it pump). The original is live audio on another clock: it's played
+# with ORIGINAL_PREFILL_S of slack and trimmed past ORIGINAL_MAX_S of backlog.
+DUCK_ATTACK_S = 0.04
+DUCK_RELEASE_S = 0.35
+DUCK_HOLD_S = 0.6
+ORIGINAL_PREFILL_S = 0.08
+ORIGINAL_MAX_S = 0.35
 
 
 def _soniox_api(key, method, path, body=None, content_type=None):
@@ -199,6 +211,11 @@ class VoiceTuning:
     # The app's Mute: silences the voice at once (mid-sentence too), and
     # sentences spoken meanwhile are dropped rather than played later.
     muted: bool = False
+
+
+def _approach(start, target, n, tau):
+    """n samples of a one-pole glide from `start` towards `target`."""
+    return target + (start - target) * np.exp(-np.arange(1, n + 1) / tau)
 
 
 def _resample(x, in_rate, out_rate):
@@ -404,19 +421,30 @@ class _AudioBuffer:
 
     def __init__(self, rate):
         self.rate = rate
+        self.active = True  # False: appends are dropped (a monitor that is off)
         self._lock = threading.Lock()
         self._chunks = []
         self._len = 0
 
     def append(self, samples):
+        if not self.active:
+            return
         with self._lock:
             self._chunks.append(samples)
             self._len += len(samples)
+
+    def clear(self):
+        with self._lock:
+            self._chunks, self._len = [], 0
 
     def seconds(self):
         return self._len / self.rate
 
     def read(self, n):
+        return self.read_count(n)[0]
+
+    def read_count(self, n):
+        """(n samples, how many of them were audio rather than padding)."""
         out = np.zeros(n, dtype=np.float32)
         filled = 0
         with self._lock:
@@ -430,42 +458,139 @@ class _AudioBuffer:
                 else:
                     self._chunks[0] = chunk[take:]
             self._len -= filled
+        return out, filled
+
+
+class _LiveBuffer(_AudioBuffer):
+    """The original sound, fed live from the input on its own clock: reads
+    wait for a little slack to build up (again after running dry), and a
+    backlog past ORIGINAL_MAX_S is dropped so it can't add delay."""
+
+    def __init__(self, rate):
+        super().__init__(rate)
+        self._primed = False
+        self._prefill = int(rate * ORIGINAL_PREFILL_S)
+
+    def append(self, samples):
+        super().append(samples)
+        with self._lock:
+            limit = self._prefill + int(self.rate * ORIGINAL_MAX_S)
+            while self._len > limit and len(self._chunks) > 1:
+                self._len -= len(self._chunks.pop(0))
+
+    def read(self, n):
+        if not self._primed:
+            if self._len < n + self._prefill:
+                return np.zeros(n, dtype=np.float32)
+            self._primed = True
+        out, filled = self.read_count(n)
+        if filled < n:
+            self._primed = False
         return out
+
+
+class _Route:
+    """One voice on one output: its buffer and channels (or a function
+    returning them, for the monitor), and the ducking state it applies to
+    the original on those channels."""
+
+    def __init__(self, buf, channels, gain):
+        self.buf, self._channels, self.gain = buf, channels, gain
+        self.env = 1.0  # the original's current gain under this voice
+        self.hold = 0  # samples the original stays down after the voice
+
+    @property
+    def channels(self):
+        return self._channels() if callable(self._channels) else self._channels
+
+    def duck(self, filled, n, rate, level):
+        """The original's gain for the next n samples, the voice having
+        played the first `filled` of them."""
+        if filled:
+            self.hold = int(rate * DUCK_HOLD_S)
+            down = n
+        else:
+            down = min(n, self.hold)
+        self.hold = max(0, self.hold - (n - filled))
+        parts = []
+        if down:
+            parts.append(_approach(self.env, level, down, rate * DUCK_ATTACK_S))
+            self.env = float(parts[-1][-1])
+        if n - down:
+            parts.append(_approach(self.env, 1.0, n - down, rate * DUCK_RELEASE_S))
+            self.env = float(parts[-1][-1])
+        return np.concatenate(parts).astype(np.float32)
 
 
 class _Mix:
     """One audio output (a sound device or an NDI source), shared by the
     voices routed to it: each voice has its own buffer, played on its own
-    channels, so two voices don't queue behind each other."""
+    channels, so two voices don't queue behind each other. With
+    `original_gain` set (a function returning the original's level under
+    the voice, or None for none), the original plays on the voices'
+    channels too, lowered while the voice on that channel speaks."""
 
     def __init__(self, rate, channels):
         self.rate = rate
         self.channels = channels
+        self.original = _LiveBuffer(rate)
+        self.original_gain = lambda: None
         self._routes = []
+        self._resampler = None
 
     def route(self, channels, gain):
         buf = _AudioBuffer(self.rate)
-        self._routes.append((buf, channels, gain))
+        self._routes.append(_Route(buf, channels, gain))
         return buf
+
+    def feed_original(self, rate, mono):
+        """Called from the input's thread (a sound device callback: keep it
+        light — numpy only)."""
+        if self.original_gain() is None:
+            if self.original.seconds():
+                self.original.clear()
+            return
+        if self._resampler is None or self._resampler_rate != rate:
+            from audio_io import _Resampler
+
+            self._resampler, self._resampler_rate = _Resampler(rate, self.rate), rate
+        self.original.append(self._resampler.process(np.array(mono, dtype=np.float32, copy=True)))
 
     def read(self, n):
         """(channels, n) float32."""
         out = np.zeros((self.channels, n), dtype=np.float32)
-        for buf, channels, gain in self._routes:
-            block = buf.read(n) * gain()
+        level = self.original_gain()
+        envs = {}  # channel -> the original's gain there (the most ducked voice wins)
+        for r in self._routes:
+            if not r.buf.active:
+                continue
+            block, filled = r.buf.read_count(n)
+            gain = r.gain()
+            channels = [c for c in r.channels if c < self.channels]
             for c in channels:
-                out[c] += block
+                out[c] += block * gain
+            if level is not None:
+                env = r.duck(filled if gain > 0 else 0, n, self.rate, level)
+                for c in channels:
+                    envs[c] = np.minimum(envs[c], env) if c in envs else env
+        if level is not None and envs:
+            original = self.original.read(n)
+            for c, env in envs.items():
+                out[c] += original * env
         return np.clip(out, -1.0, 1.0)
 
 
 class _DeviceOutput:
-    def __init__(self, device_index, channels, buffer_s):
+    def __init__(self, device_index, channels, buffer_s, mix=None):
+        """`device_index` None: the system's default output. `mix`: an
+        existing _Mix at the device's rate (the monitor's)."""
         import sounddevice as sd
 
-        info = sd.query_devices(device_index)
-        self.mix = _Mix(int(info["default_samplerate"]), channels)
+        info = sd.query_devices(device_index, kind="output")
+        self.name = info["name"]
+        self.mix = mix or _Mix(int(info["default_samplerate"]), channels)
         self._stream = sd.OutputStream(
-            device=device_index, samplerate=self.mix.rate, channels=channels, dtype="float32",
+            device=device_index, samplerate=self.mix.rate, channels=self.mix.channels, dtype="float32",
             latency=buffer_s, callback=self._callback,
         )
 
@@ -533,13 +658,17 @@ class _Voice:
         self.label = settings.label
         self._texts = queue.Queue()
         self._buffers = []
-        self.listener = None  # see VoiceOutput.set_listener
-        self.lane = 0
+        self.monitor = None  # its buffer on the monitor output (see VoiceOutput.set_monitor)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._synth_loop, daemon=True)
 
     def attach(self, mix, channels):
         self._buffers.append(mix.route(channels, self._gain))
+
+    def _targets(self):
+        """The buffers it plays into now (the monitor's only while it's on)."""
+        monitor = self.monitor
+        return self._buffers + [monitor] if monitor is not None and monitor.active else self._buffers
 
     def start(self):
         self._thread.start()
@@ -556,7 +685,7 @@ class _Voice:
             self._texts.put((time.monotonic(), info))
 
     def _pending_s(self):
-        audio = max((b.seconds() for b in self._buffers), default=0.0)
+        audio = max((b.seconds() for b in self._targets()), default=0.0)
         with self._texts.mutex:
             queued = sum(len(info.get("source", "")) for _t, info in self._texts.queue)
         return audio + queued / CHARS_PER_S
@@ -607,7 +736,7 @@ class _Voice:
             if self.tuning.muted:
                 continue
             waited = time.monotonic() - queued_at
-            buffered = max((b.seconds() for b in self._buffers), default=0.0)
+            buffered = max((b.seconds() for b in self._targets()), default=0.0)
             if waited + buffered > MAX_LAG_S:
                 self.log(f"{self.label} too far behind — skipped: {info.get('source', '')[:60]}")
                 continue
@@ -621,31 +750,24 @@ class _Voice:
                     self._play(synth, synth.stream(text, speed))
                 else:
                     pcm = synth.synth(text, speed)
-                    for buf in self._buffers:
+                    for buf in self._targets():
                         buf.append(_resample(pcm, synth.rate, buf.rate))
-                    self._feed_listener(synth.rate, pcm)
             except Exception as e:
                 self.log(f"{self.label} error: {e}")
 
     def _play(self, synth, chunks):
         """Queues a sentence on the outputs chunk by chunk, as it's
         synthesized."""
-        resamplers = [(buf, _StreamResampler(synth.rate, buf.rate)) for buf in self._buffers]
+        resamplers = [(buf, _StreamResampler(synth.rate, buf.rate)) for buf in self._targets()]
         try:
             for pcm in chunks:
                 if self._stop.is_set() or self.tuning.muted:
                     return
                 for buf, resampler in resamplers:
                     buf.append(resampler.process(pcm))
-                self._feed_listener(synth.rate, pcm)
         finally:
             for buf, resampler in resamplers:
                 buf.append(resampler.flush())
-
-    def _feed_listener(self, rate, pcm):
-        listener = self.listener
-        if listener is not None:
-            listener.feed(rate, pcm * self._gain(), lane=self.lane)
 
     def _gain(self):
         return 0.0 if self.tuning.muted else self.tuning.volume
@@ -657,16 +779,28 @@ class VoiceOutput:
     device or on the NDI output's audio share it, each on its own channels.
     The buffer size is the first voice's."""
 
-    def __init__(self, voices, ndi_sender, make_sender, log):
+    def __init__(self, voices, ndi_sender, make_sender, log, duck_db=None):
         """`voices`: [(VoiceSettings, VoiceTuning)]. `ndi_sender`: the NDI
         output (for voices with ndi_channels). `make_sender(name)`: creates
-        an NDI sender, for voices with an ndi_source of their own."""
+        an NDI sender, for voices with an ndi_source of their own.
+        `duck_db`: see the attribute."""
         self.log = log
         self._voices = [_Voice(s, t, log) for s, t in voices]
         self._buffer_s = max(0.02, voices[0][1].buffer_ms / 1000.0)
         self._ndi_sender = ndi_sender
         self._make_sender = make_sender
         self._outputs = []
+        self._monitor_mix = None
+        self._monitor_out = None
+        self._monitored = set()
+        # The original's level (dB) under a speaking voice, on the voices'
+        # channels (None: the voices only). Settable live.
+        self.duck_db = duck_db
+
+    def _original_gain(self):
+        if self.duck_db is None or all(v.tuning.muted for v in self._voices):
+            return None
+        return 10.0 ** (self.duck_db / 20.0)
 
     def start(self):
         try:
@@ -676,8 +810,75 @@ class VoiceOutput:
         except Exception:
             self._close_outputs()
             raise
+        for out in self._outputs:
+            out.mix.original_gain = self._original_gain
+        self._prepare_monitor()
         for v in self._voices:
             v.start()
+
+    def _prepare_monitor(self):
+        """Routes every voice to a mix for the default output, inactive
+        until set_monitor() turns it on (the device opens only then)."""
+        try:
+            import sounddevice as sd
+
+            info = sd.query_devices(kind="output")
+            mix = _Mix(int(info["default_samplerate"]), min(2, int(info["max_output_channels"])))
+        except Exception as e:
+            self.log(f"No default audio output to monitor the voices: {e}")
+            return
+        mix.original_gain = self._original_gain
+        for v in self._voices:
+            v.monitor = mix.route(lambda v=v: self._monitor_channels(v), v._gain)
+            v.monitor.active = False
+        self._monitor_mix = mix
+
+    def _monitor_channels(self, v):
+        """Alone: both sides. Two voices monitored: first left, second right."""
+        if self._monitor_mix.channels < 2:
+            return (0,)
+        if len(self._monitored) > 1:
+            return (self._voices.index(v) % 2,)
+        return (0, 1)
+
+    def set_monitor(self, labels):
+        """Plays the voices whose label is in `labels` (with the original
+        under them, as on the outputs) on the computer's default output;
+        none closes it. Returns the output's name, or None. Called from the
+        UI thread; raises if the device can't be opened."""
+        mix = self._monitor_mix
+        if mix is None:
+            return None
+        self._monitored = {v.label for v in self._voices if v.label in labels}
+        for v in self._voices:
+            on = v.label in self._monitored
+            if not on:
+                v.monitor.clear()
+            v.monitor.active = on
+        if self._monitored and self._monitor_out is None:
+            out = _DeviceOutput(None, mix.channels, self._buffer_s, mix=mix)
+            out.start()
+            self._monitor_out = out
+        elif not self._monitored and self._monitor_out is not None:
+            self._close_monitor()
+        return self._monitor_out.name if self._monitor_out is not None else None
+
+    def _close_monitor(self):
+        out, self._monitor_out = self._monitor_out, None
+        if out is not None:
+            try:
+                out.stop()
+            except Exception:
+                pass
+            self._monitor_mix.original.clear()  # not stale when it reopens
+
+    def feed_original(self, rate, mono):
+        """The input's audio, live (the speech engine's capture calls this
+        from its thread): the original under the voices."""
+        for out in self._outputs:
+            out.mix.feed_original(rate, mono)
+        if self._monitor_out is not None:
+            self._monitor_mix.feed_original(rate, mono)
 
     def _open_outputs(self):
         voices = self._voices
@@ -729,17 +930,7 @@ class VoiceOutput:
         for v in self._voices:
             v.stop()
         self._close_outputs()
-
-    def set_listener(self, listener):
-        """Also plays each synthesized sentence on `listener` (an
-        audio_io.ListenOutput, unbounded), so the operator can hear the
-        voices — with two, the first on the left and the second on the
-        right. None stops. Callable from any thread."""
-        for lane, v in enumerate(self._voices):
-            if listener is not None and len(self._voices) > 1:
-                listener.add_lane(lane)
-            v.lane = lane
-            v.listener = listener
+        self._close_monitor()
 
     def say(self, info):
         """Queues one final sentence: the `info` dict from the speech
