@@ -1350,7 +1350,6 @@ class App:
             source_lang=self._source_lang_code(),
             target_lang=self._target_lang_code(),
             whisper_model=self.whisper_model_var.get(),
-            hotwords=self.hotwords_var.get(),
             azure_key=self.azure_key_var.get(),
             azure_region=self.azure_region_var.get(),
             soniox_key=self.soniox_key_var.get(),
