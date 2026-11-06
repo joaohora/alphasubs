@@ -57,8 +57,12 @@ AZURE_MERGE_MAX_S = 8.0
 SONIOX_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 SONIOX_MODEL = "stt-rt-v5"
 SONIOX_API_URL = "https://api.soniox.com"
-# Silence after which Soniox ends an utterance (500-3000 ms).
+# Silence after which Soniox ends an utterance (500-3000 ms): short gets
+# the voice out sooner, long keeps more of a thought in one sentence (more
+# context for the translation). SpeechSettings.endpoint_ms.
 SONIOX_ENDPOINT_DELAY_MS = 500
+SONIOX_ENDPOINT_RANGE_MS = (500, 3000)
+CONTEXT_TEXT_MAX = 8000  # characters of background text sent
 SPEECHMATICS_URL = "wss://eu.rt.speechmatics.com/v2/"
 SPEECHMATICS_MAX_DELAY_S = 2.0
 SPEECHMATICS_END_SILENCE_S = 0.8
@@ -155,6 +159,28 @@ class SpeechSettings:
     # Soniox: a conversation — both source_lang and target_lang are spoken,
     # and each is translated into the other (one connection, "two_way").
     two_way: bool = False
+    # What the event is about, for the translation (Soniox and Claude): a
+    # topic, a background text (programme, speakers...), and a glossary,
+    # one "source = target" per line. See also hotwords.
+    context_topic: str = ""
+    context_text: str = ""
+    glossary: str = ""
+    endpoint_ms: int = SONIOX_ENDPOINT_DELAY_MS  # Soniox: see SONIOX_ENDPOINT_DELAY_MS
+    # The settings _Engine.apply() can change while running.
+    LIVE = ("hotwords", "context_topic", "context_text", "glossary", "endpoint_ms")
+
+
+def glossary_pairs(text):
+    """[(source, target)] from "source = target" lines (also "→", "->")."""
+    pairs = []
+    for line in text.splitlines():
+        for sep in ("=", "→", "->"):
+            if sep in line:
+                src, dst = (part.strip() for part in line.split(sep, 1))
+                if src and dst:
+                    pairs.append((src, dst))
+                break
+    return pairs
 
 
 def _best_cuda_compute_type(ctranslate2):
@@ -262,9 +288,17 @@ class ClaudeTranslation:
         s = self.settings
         history = self._history.setdefault(target, deque(maxlen=CLAUDE_CONTEXT_SENTENCES))
         parts = []
+        if s.context_topic.strip():
+            parts.append(f"Topic of the event: {s.context_topic.strip()}")
+        if s.context_text.strip():
+            parts.append(f"About the event (background only):\n{s.context_text.strip()[:CONTEXT_TEXT_MAX]}")
         terms = s.hotwords.strip()
         if terms:
             parts.append(f"Names and terms (keep exactly as written): {terms}")
+        glossary = glossary_pairs(s.glossary)
+        if glossary:
+            lines = "\n".join(f"- {src} → {dst}" for src, dst in glossary)
+            parts.append(f"Glossary (always translate these this way):\n{lines}")
         if history:
             lines = "\n".join(f"- {src}\n  → {out}" for src, out in history)
             parts.append(f"Previous sentences and their translations (context only):\n{lines}")
@@ -384,6 +418,17 @@ class _Engine:
         """[(label, seconds connected)] per connection to a cloud service
         since Start (none for the local engine)."""
         return []
+
+    def apply(self, **changes):
+        """Changes SpeechSettings.LIVE fields while running. Claude's
+        translation takes them from its next sentence; a cloud engine
+        reconnects to pass them on (see _CloudStreamEngine). Returns whether
+        the recognition itself took them (the local and Azure engines
+        don't: next Start)."""
+        self.settings = replace(self.settings, **changes)
+        if self.translation is not None:
+            self.translation.settings = replace(self.translation.settings, **changes)
+        return False
 
     def _open_capture(self):
         s = self.settings
@@ -986,6 +1031,18 @@ class _CloudStreamEngine(_Engine):
         self._helpers = []  # their engines
         self._connected_s = 0.0
         self._connected_at = None
+        self._reconfigure = threading.Event()  # see apply()
+
+    def apply(self, **changes):
+        """Reconnects with the new settings: the current connection is
+        closed cleanly (its last results still come in) and a new one opens
+        — a gap of ~1-2 s in the results, but no speech is lost: the audio
+        captured meanwhile is sent to the new connection."""
+        super().apply(**changes)
+        for helper in self._helpers:
+            helper.apply(**changes)
+        self._reconfigure.set()
+        return True
 
     def connections(self):
         at = self._connected_at
@@ -1006,6 +1063,7 @@ class _CloudStreamEngine(_Engine):
         self._fatal = None
         self._open_capture()
         connected_once = False
+        planned = False  # reconnecting for apply(): keep the audio of the gap
         while not self.stop_event.is_set():
             try:
                 ws = self._connect()
@@ -1025,18 +1083,22 @@ class _CloudStreamEngine(_Engine):
                 self.log(
                     f"Listening ({self.service}, {self.settings.source_lang} "
                     f"{'<->' if getattr(self.settings, 'two_way', False) else '->'} {self.settings.target_lang}"
-                    f"{'' if self.translation is None else ', translation by Claude'})."
+                    f"{'' if self.translation is None else ', translation by Claude'})"
+                    f"{self._settings_note()}."
                 )
                 connected_once = True
+            elif planned:
+                self.log(f"{self.service}: new settings applied{self._settings_note()}.")
             else:
                 self.log(f"{self.service}: reconnected.")
                 self.capture.read(timeout=0)  # skip the audio of the outage
+            planned = False
             self.on_status("Listening.")
             self._connected_at = time.monotonic()
             reader = threading.Thread(target=self._read, args=(ws,), daemon=True)
             reader.start()
             try:
-                while not self.stop_event.is_set() and reader.is_alive():
+                while not self.stop_event.is_set() and reader.is_alive() and not self._reconfigure.is_set():
                     block = self.capture.read(timeout=0.1)
                     if block is not None and len(block):
                         self._send_audio(ws, (np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
@@ -1046,7 +1108,7 @@ class _CloudStreamEngine(_Engine):
                         self._emit(self._utterances.ready())
                         if time.monotonic() - self._activity >= HOLD_IDLE_S:
                             self._confirmed.release()
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or self._reconfigure.is_set():
                     self._finish(ws)
                     reader.join(timeout=3.0)
             except ConnectionClosed:
@@ -1061,10 +1123,18 @@ class _CloudStreamEngine(_Engine):
                     self._confirmed.release()
             if self._fatal:
                 raise RuntimeError(self._fatal)
+            if self._reconfigure.is_set():
+                self._reconfigure.clear()
+                planned = True
+                continue
             if not self.stop_event.is_set():
                 self.log(f"{self.service}: connection lost — reconnecting.")
                 self.on_status(f"{self.service}: reconnecting...")
                 self.stop_event.wait(RECONNECT_DELAY_S)
+
+    def _settings_note(self):
+        """For the Log: the context settings in use."""
+        return ""
 
     def _read(self, ws):
         from websockets.exceptions import ConnectionClosed
@@ -1214,13 +1284,30 @@ class SonioxEngine(_CloudStreamEngine):
             ),
             "enable_language_identification": True,
             "enable_endpoint_detection": True,
-            "max_endpoint_delay_ms": SONIOX_ENDPOINT_DELAY_MS,
+            "max_endpoint_delay_ms": int(min(max(s.endpoint_ms, SONIOX_ENDPOINT_RANGE_MS[0]),
+                                             SONIOX_ENDPOINT_RANGE_MS[1])),
         }
         if s.source_lang != "auto":
             config["language_hints_strict"] = True
+        context = {}
+        general = []
+        if s.context_topic.strip():
+            general.append({"key": "Topic", "value": s.context_topic.strip()})
+        if self.translating and "pt" in (s.target_lang, s.source_lang if s.two_way else None):
+            # Without it, Soniox sometimes translates into Brazilian Portuguese.
+            general.append({"key": "Portuguese variant", "value": "European Portuguese (Portugal)"})
+        if general:
+            context["general"] = general
+        if s.context_text.strip():
+            context["text"] = s.context_text.strip()[:CONTEXT_TEXT_MAX]
         terms = [t.strip() for t in s.hotwords.split(",") if t.strip()]
         if terms:
-            config["context"] = {"terms": terms}
+            context["terms"] = terms
+        glossary = glossary_pairs(s.glossary)
+        if glossary and self.translating:
+            context["translation_terms"] = [{"source": src, "target": dst} for src, dst in glossary]
+        if context:
+            config["context"] = context
         if self.translating and s.two_way:
             config["translation"] = {"type": "two_way", "language_a": s.source_lang, "language_b": s.target_lang}
         elif self.translating:
@@ -1278,6 +1365,17 @@ class SonioxEngine(_CloudStreamEngine):
 
     def _finish(self, ws):
         ws.send("")  # an empty text frame ends the stream
+
+    def _settings_note(self):
+        s = self.settings
+        bits = [f"pause {s.endpoint_ms} ms"]
+        if s.context_topic.strip():
+            bits.append(f"topic \"{s.context_topic.strip()[:40]}\"")
+        if s.context_text.strip():
+            bits.append(f"{len(s.context_text.strip())} characters of background")
+        if glossary_pairs(s.glossary):
+            bits.append(f"{len(glossary_pairs(s.glossary))} glossary terms")
+        return " (" + ", ".join(bits) + ")"
 
 
 class SpeechmaticsEngine(_CloudStreamEngine):

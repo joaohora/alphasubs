@@ -17,6 +17,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import astuple
+from types import SimpleNamespace
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
@@ -104,6 +105,7 @@ APP_SETTING_KEYS = (
     "input_mode", "ndi_source_name", "output_name",
     "device_label", "channel", "source_lang", "target_lang", "engine", "whisper_model", "hotwords",
     "translation", "claude_model", "two_way",
+    "context_topic", "context_text", "glossary", "endpoint_ms",
     *(f"{prefix}{name}" for prefix in ("voice_", "voice2_") for name in (
         "engine", "name", "lang", "device_label", "device_channels", "ndi_route", "ndi", "speed", "volume",
     )),
@@ -982,11 +984,21 @@ class App:
 
         ttk.Label(frame, text="Names / terms:").grid(row=7, column=0, sticky="w", pady=2)
         self.hotwords_var = tk.StringVar(value=prefs.get("hotwords", ""))
-        entry(frame, self.hotwords_var).grid(row=7, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        # Not locked while running: "Apply now" in Translation context passes it on.
+        ttk.Entry(frame, textvariable=self.hotwords_var).grid(row=7, column=1, sticky="we", padx=4, pady=2)
+        self._make_simple_button(frame, "Translation context...", self._open_context_dialog).grid(
+            row=7, column=2, sticky="e", padx=4, pady=2
+        )
         ttk.Label(
             frame, text="Comma-separated, e.g. Gulbenkian, Coro Gulbenkian — helps recognize names.",
             foreground=MUTED_FG,
         ).grid(row=8, column=1, columnspan=2, sticky="w", padx=4)
+        # Translation context (see _open_context_dialog).
+        self.context_cfg = SimpleNamespace(
+            topic=prefs.get("context_topic", ""), text=prefs.get("context_text", ""),
+            glossary=prefs.get("glossary", ""),
+            endpoint_ms=int(prefs.get("endpoint_ms", speech.SONIOX_ENDPOINT_DELAY_MS if speech else 500)),
+        )
 
         if speech is None:
             ttk.Label(
@@ -1347,7 +1359,131 @@ class App:
             claude_key=self.claude_key_var.get(),
             claude_model=self.claude_model_var.get(),
             two_way=self._two_way(),
+            **self._context_settings(),
         )
+
+    def _context_settings(self):
+        """The SpeechSettings.LIVE fields, from the UI."""
+        c = self.context_cfg
+        return dict(
+            hotwords=self.hotwords_var.get(), context_topic=c.topic, context_text=c.text,
+            glossary=c.glossary, endpoint_ms=int(c.endpoint_ms),
+        )
+
+    def _open_context_dialog(self):
+        """What the event is about, for the translation (Soniox and Claude),
+        and Soniox's sentence pause. Applies on Start, or right away with
+        "Apply now" while running."""
+        if speech is None:
+            return
+        win = getattr(self, "_context_win", None)
+        if win is not None and win.winfo_exists():
+            self._load_context_dialog()
+            win.deiconify()
+            win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Translation context")
+        win.configure(bg=BG)
+        self._darken_titlebar(win)
+        self._context_win = win
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        frame.columnconfigure(1, weight=1)
+        c = self.context_cfg
+
+        def note(row, text):
+            ttk.Label(frame, text=text, foreground=MUTED_FG, wraplength=520, justify="left").grid(
+                row=row, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6)
+            )
+
+        def text_box(row, height):
+            box = tk.Text(
+                frame, height=height, width=60, wrap="word", bg=FIELD_BG, fg=FG, insertbackground=FG,
+                relief="flat", highlightthickness=1, highlightbackground=BORDER, font=self.normal_font,
+            )
+            box.grid(row=row, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+            return box
+
+        ttk.Label(frame, text="Topic:").grid(row=0, column=0, sticky="w", pady=2)
+        topic_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=topic_var).grid(row=0, column=1, columnspan=2, sticky="we", padx=4, pady=2)
+        note(1, "e.g. Contemporary art conference; Orchestra season presentation; Medical symposium.")
+
+        ttk.Label(frame, text="Background:").grid(row=2, column=0, sticky="nw", pady=2)
+        text_box_bg = text_box(2, 6)
+        note(3, "Programme, speakers, subject — whatever helps understand what will be said"
+                f" (up to {speech.CONTEXT_TEXT_MAX} characters).")
+
+        ttk.Label(frame, text="Glossary:").grid(row=4, column=0, sticky="nw", pady=2)
+        glossary_box = text_box(4, 6)
+        note(5, "How to translate specific terms, one per line: source = translation\n"
+                "e.g. Gulbenkian Foundation = Fundação Gulbenkian")
+
+        self._add_slider(frame, 6, "Sentence pause (ms)", *speech.SONIOX_ENDPOINT_RANGE_MS, c.endpoint_ms,
+                         "endpoint_ms", target=c, key="endpoint_ms")
+        note(7, "Soniox: the silence that ends a sentence. Short: the voice comes sooner. Longer: a"
+                f" thought stays in one sentence, more context for the translation, more delay."
+                f" Default {speech.SONIOX_ENDPOINT_DELAY_MS} ms.")
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        self._make_simple_button(buttons, "Apply now", lambda: self._apply_context(), kind="accent").pack(side="left")
+        status_var = tk.StringVar()
+        ttk.Label(buttons, textvariable=status_var, foreground=MUTED_FG, wraplength=420, justify="left").pack(
+            side="left", padx=10
+        )
+        ttk.Label(
+            frame, foreground=MUTED_FG, wraplength=600, justify="left",
+            text="Used from the next Start; while running, Apply now passes these and the Names / terms"
+                 " (Input panel) on at once — Soniox reconnects, with a gap of ~1–2 s in the captions"
+                 " and voices, no speech lost. Claude translation uses them from the next sentence.",
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        def store(_event=None):
+            c.topic = topic_var.get().strip()
+            c.text = text_box_bg.get("1.0", "end-1c").strip()
+            c.glossary = glossary_box.get("1.0", "end-1c").strip()
+
+        def load():
+            # The boxes first: setting the topic stores all three.
+            for box, value in ((text_box_bg, c.text), (glossary_box, c.glossary)):
+                box.delete("1.0", "end")
+                box.insert("1.0", value)
+            topic_var.set(c.topic)
+            self.sliders["endpoint_ms"].set(c.endpoint_ms)
+
+        topic_var.trace_add("write", lambda *_: store())
+        def on_modified(box):
+            store()
+            box.edit_modified(False)  # re-arms <<Modified>> for the next change
+
+        for box in (text_box_bg, glossary_box):
+            box.bind("<<Modified>>", lambda e, box=box: on_modified(box))
+        self._load_context_dialog = load
+        self._context_status = status_var
+        load()
+
+    def _apply_context(self):
+        """Passes the translation context on to the running engine."""
+        status = self._context_status
+        engine = self._engine
+        if engine is None:
+            status.set("Saved — used on the next Start.")
+            return
+        changes = self._context_settings()
+        try:
+            took = engine.apply(**changes)
+        except Exception as e:
+            status.set(f"Could not apply: {e}")
+            return
+        if took:
+            status.set("Applied — reconnecting (~1–2 s).")
+            self._append_log("Translation context: applying now (reconnecting).")
+        elif self._translation_code() == "claude":
+            status.set("Applied to the Claude translation; the recognition takes it on the next Start.")
+        else:
+            status.set("This engine takes it on the next Start.")
 
     def _update_level_meter(self, level_db):
         frac = min(1.0, max(0.0, (level_db + 60.0) / 60.0))
@@ -2826,6 +2962,10 @@ class App:
             "translation": self._translation_code(),
             "two_way": self.two_way_var.get(),
             "claude_model": self.claude_model_var.get(),
+            "context_topic": self.context_cfg.topic,
+            "context_text": self.context_cfg.text,
+            "glossary": self.context_cfg.glossary,
+            "endpoint_ms": int(self.context_cfg.endpoint_ms),
         }
         for slot in self.voice_slots:
             route = self._ndi_route(slot)
@@ -2882,6 +3022,14 @@ class App:
             for key, var in (("whisper_model", self.whisper_model_var), ("hotwords", self.hotwords_var)):
                 if key in values:
                     var.set(values[key])
+            for key, attr in (("context_topic", "topic"), ("context_text", "text"), ("glossary", "glossary")):
+                if key in values:
+                    setattr(self.context_cfg, attr, values[key] or "")
+            if "endpoint_ms" in values:
+                self.context_cfg.endpoint_ms = int(values["endpoint_ms"])
+            win = getattr(self, "_context_win", None)
+            if win is not None and win.winfo_exists():
+                self._load_context_dialog()
             if values.get("claude_model") in speech.CLAUDE_MODELS:
                 self.claude_model_var.set(values["claude_model"])
             if "device_label" in values:

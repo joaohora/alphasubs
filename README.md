@@ -170,6 +170,24 @@ card (**Input**) and set **Input type** to *Audio (speech-to-text)*:
   sentences only. If Claude fails, the engine's own text is used.
 - **Names / terms:** comma-separated words to bias recognition (names of
   performers, works, institutions).
+- **Translation context...** (next to it): what the event is about, for the
+  translation (Soniox and Claude):
+  - *Topic* (e.g. "Contemporary art conference");
+  - *Background*: programme, speakers, subject (up to 8000 characters);
+  - *Glossary*: how to translate specific terms, one per line,
+    `source = translation` (e.g. `CAM = Centro de Arte Moderna`);
+  - *Sentence pause* (Soniox, 500–3000 ms, default 500): the silence that
+    ends a sentence. Longer keeps a whole thought in one sentence (more
+    context for the translation) but the voice and captions come later.
+
+  Used on Start. While running, **Apply now** passes these and the Names /
+  terms on at once: Soniox reconnects, a gap of ~1–2 s in the captions and
+  voices with no speech lost (the audio of the gap is sent afterwards).
+  Claude translation uses them from the next sentence.
+
+  Translating into Portuguese, Soniox is always told it's European
+  Portuguese (without it, it sometimes chose Brazilian: "celulares" instead
+  of "telemóveis").
 
 The TEXT panel then shows the caption layout (font size, number of lines,
 line width, bottom margin, clear-after-silence time) instead of the keying
